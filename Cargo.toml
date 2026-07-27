@@ -1,0 +1,29 @@
+[package]
+name = "promptboot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+
+[workspace]
+members = ["crates/promptboot-core", "crates/promptboot-tools"]
+resolver = "2"
+
+[[bin]]
+name = "promptboot"
+path = "src/main.rs"
+
+[dependencies]
+promptboot-core = { path = "crates/promptboot-core" }
+
+[features]
+default = []
+
+[profile.release]
+codegen-units = 1
+debug = 0
+incremental = false
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

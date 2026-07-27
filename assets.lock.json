@@ -1,0 +1,36 @@
+{
+  "assets": [
+    {
+      "kind": "qwen_gguf",
+      "license": "Apache-2.0",
+      "name": "qwen2.5-0.5b-instruct-q4_0.gguf",
+      "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+      "sha256": "7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed",
+      "size": 428730208,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_0.gguf?download=true"
+    },
+    {
+      "kind": "qwen_license",
+      "license": "Apache-2.0",
+      "name": "QWEN-LICENSE",
+      "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+      "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
+      "size": 11343,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/LICENSE"
+    },
+    {
+      "archive_license": {
+        "path": "LICENSE",
+        "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+        "size": 1078
+      },
+      "kind": "llama_archive",
+      "license": "MIT",
+      "name": "llama.cpp-571d0d540df04f25298d0e159e520d9fc62ed121.tar.gz",
+      "revision": "571d0d540df04f25298d0e159e520d9fc62ed121",
+      "sha256": "26a60bd05d7d078d44b2d67babc5d21ab2365da1cf3fe66b30368f4ffc7d78ad",
+      "size": 35937387,
+      "url": "https://github.com/ggml-org/llama.cpp/archive/571d0d540df04f25298d0e159e520d9fc62ed121.tar.gz"
+    }
+  ]
+}

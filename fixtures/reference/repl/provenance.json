@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "llama_revision": "571d0d540df04f25298d0e159e520d9fc62ed121",
+  "source_gguf_sha256": "7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed",
+  "extractor": "tests/fixtures/reference/repl_reference_extract.cpp",
+  "extractor_sha256": "d7b32fc7039b6c4dfa5f2a5bd01474c12cb4fd3ccb19b828a89fb1587a6bee8d"
+}

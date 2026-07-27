@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "source_revision": "571d0d540df04f25298d0e159e520d9fc62ed121",
+  "source_archive_sha256": "26a60bd05d7d078d44b2d67babc5d21ab2365da1cf3fe66b30368f4ffc7d78ad",
+  "helper": {
+    "path": "tests/fixtures/inference/inference_kernel_oracle.cpp",
+    "sha256": "2542cf541698d62ec2289dd13f872c4d1de9c5ab67549abab51b2fedcb3f1832",
+    "two_builds_byte_identical": true,
+    "two_output_runs_byte_identical": true,
+    "promptboot_core_linked": false
+  },
+  "source_files": {
+    "ggml/include/ggml-cpu.h": "316279e004cdeb8e6ef78599acb602bf79a8abdf897fed9fd1914808c1518c6e",
+    "ggml/include/ggml.h": "c65c30fdb4dce95eac71c26bb38ae8423fbc80d79db91d2b2ffaea8c4e46276a",
+    "ggml/src/ggml-cpu/ops.cpp": "dd7265a7402515002d4679f18d5d1d423456e87f256f7cc11af3bbb4148bf773",
+    "ggml/src/ggml-cpu/quants.c": "a61f1011e49d05b5f99d352b158d5b8e36cf008294bb0db309f72bdd7f1d4e35",
+    "ggml/src/ggml-cpu/quants.h": "918d6755b3e601ec7bb83c7dbf1d73304490651ccbb4072b0d31a2b45df751da",
+    "ggml/src/ggml-cpu/vec.cpp": "cda0babb53f9c8ff1faa7459b2c49019d15e5970dfe0c613d58e2659e919f524",
+    "ggml/src/ggml-cpu/vec.h": "926330bae1c5d003bd654035426e31381fafcdca23ffcc23201d219dbb97cbeb",
+    "ggml/src/ggml-quants.c": "07143d7068936ae46b3c528b2f3d4bbb666e74d88992165716174d243573965d",
+    "ggml/src/ggml-quants.h": "28ae5fca1f3be636b36cd6c4fa2ca74fd42d229bfbd5352eaf66f3727bb8a6da"
+  },
+  "oracle_boundaries": {
+    "q8": "quantize_row_q8_0_ref",
+    "q4_q8_dot": "ggml_vec_dot_q4_0_q8_0_generic",
+    "q8_q8_dot": "ggml_vec_dot_q8_0_q8_0_generic",
+    "attention_dots": "ggml_vec_dot_f32",
+    "attention_softmax": "ggml_vec_soft_max_f32",
+    "swiglu": "ggml_vec_swiglu_f32",
+    "rms": "verbatim arithmetic order from ggml/src/ggml-cpu/ops.cpp lines 3822-3848",
+    "rope": "four-operation formula over independently frozen glibc table"
+  },
+  "inputs": {
+    "q8": "six named 32-value blocks: zero; signed equal maxima; half-away ties; FP16 scale tie; signed 126.5; signed zero",
+    "dots": "two blocks with deterministic Q4/Q8 weights and signed activation values, extrema at words 31 and 63",
+    "rms": "896 words x[i]=((i mod 17)-8)/8, w[i]=((i mod 7)+1)/4, epsilon=1e-6",
+    "swiglu": "4864 words gate[i]=((i mod 33)-16)/16, up[i]=((i mod 19)-9)/8",
+    "attention": "14 query heads, two KV heads, 64 components; deterministic rational query/K/V; current positions 2 and 256; padded spans 256 and 512",
+    "rope": "one 64-word head x[i]=(i-32)/16 at position 511"
+  },
+  "outputs": {
+    "attention-256.bin": {"bytes": 3584, "sha256": "623d8a942d109f5f0606ce1f00b4757758d567ab40842e8e4ce4671295e59834"},
+    "attention-512.bin": {"bytes": 3584, "sha256": "1a386ebbbf897b7709d8cade1549041415ac80d03f5e89b30c39424987fab043"},
+    "dots.bin": {"bytes": 8, "sha256": "60ee60ef8baab1a4aef572a18b5dcc82bb69af7e45950e3e60daefdbb64760a4"},
+    "q8.bin": {"bytes": 204, "sha256": "605fb0c7e8f7d52a6e942b78e5f51340302e84d4f50e090369ded4e0bb111052"},
+    "rms.bin": {"bytes": 3584, "sha256": "74ca732ed2538165b72cbfefc766de0bb0d14117ea3ab8a588e097e576560a5c"},
+    "rope.bin": {"bytes": 256, "sha256": "2428f74055d47f641740f2a914403b95118155c29a9d5d5d32b38fb12b2ad672"},
+    "scores-256.bin": {"bytes": 1024, "sha256": "0698daf221562bfa6d8d3a954abb35489155e53b73c1feab1904708300e74e58"},
+    "scores-512.bin": {"bytes": 2048, "sha256": "a027538d38b56e069ddcfafe848c17b361a92e01463c0c98f743ba011e6cadd0"},
+    "swiglu.bin": {"bytes": 19456, "sha256": "1763ddc60a335d5253dd4a3dcb69bfb12b85e7104c760be3870eaf75c0fc3aa0"}
+  }
+}

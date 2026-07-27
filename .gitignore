@@ -1,0 +1,7 @@
+/.cache/
+/build/
+/target/
+/vendor/
+/AGENTS.md
+__pycache__/
+*.pyc

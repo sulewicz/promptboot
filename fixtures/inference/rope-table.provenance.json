@@ -1,0 +1,34 @@
+{
+  "bytes": 8388608,
+  "dimensions": [32768, 32, 2],
+  "element_type": "f32le",
+  "generation": {
+    "angle_initial": "binary32(position)",
+    "angle_step": "binary32(theta * theta_scale)",
+    "cosine": "glibc cosf",
+    "frequency_base_bits": "0x49742400",
+    "libm_path": "/usr/lib64/libm.so.6",
+    "libm_rpm": "glibc-2.43-7.fc44.x86_64",
+    "libm_sha256": "ad29671950bd805b801d732c0977864cfc5dd8e72789ae18c33e0423c222dc09",
+    "sine": "glibc sinf",
+    "theta_scale": "powf(1000000.0f, -2.0f / 64.0f)",
+    "theta_scale_bits": "0x3f263de0"
+  },
+  "generator": "tests/fixtures/inference/generate_inference_rope_fixture.py",
+  "generator_sha256": "6a96aa240fcbcbd40ad8d4c77f5dae0cec976bb38fd4a37899ce2539dd2697b7",
+  "llama_revision": "571d0d540df04f25298d0e159e520d9fc62ed121",
+  "selected_bits": [
+    {"position": 0, "pair": 0, "cos": "0x3f800000", "sin": "0x00000000"},
+    {"position": 1, "pair": 4, "cos": "0x3f7bf683", "sin": "0x3e35233b"},
+    {"position": 7, "pair": 2, "cos": "0xbf7b6821", "sin": "0x3e411b5d"},
+    {"position": 29, "pair": 31, "cos": "0x3f800000", "sin": "0x383b4f09"},
+    {"position": 255, "pair": 17, "cos": "0x3f7c7f87", "sin": "0x3e28caee"},
+    {"position": 511, "pair": 31, "cos": "0x3f7ffffb", "sin": "0x3a4e4824"},
+    {"position": 32767, "pair": 31, "cos": "0x3f7fac96", "sin": "0x3d4e9771"}
+  ],
+  "sha256": "cd75fcc63f7514055daf75917521bfe4612ce6417419de5ce77ca766473c01c5",
+  "source": [
+    "ggml/src/ggml-cpu/ops.cpp:ggml_rope_cache_init",
+    "ggml/src/ggml-cpu/ops.cpp:rotate_pairs"
+  ]
+}

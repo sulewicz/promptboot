@@ -1,0 +1,35 @@
+{
+  "case": "context_thresholds",
+  "llama_revision": "571d0d540df04f25298d0e159e520d9fc62ed121",
+  "prior_history": {
+    "source_case": "eos-turn2.json",
+    "source_turn": 1,
+    "tokens": 39,
+    "turns": 1
+  },
+  "cases": [
+    {
+      "name": "fresh_boundary_480",
+      "user_byte": 48,
+      "user_bytes": 451,
+      "fresh_prompt_tokens": 480,
+      "outcome": "GENERATE"
+    },
+    {
+      "name": "prospective_reset",
+      "user_byte": 48,
+      "user_bytes": 450,
+      "fresh_prompt_tokens": 479,
+      "suffix_tokens": 459,
+      "prospective_tokens": 498,
+      "outcome": "HISTORY_RESET_THEN_GENERATE"
+    },
+    {
+      "name": "fresh_reject_481",
+      "user_byte": 48,
+      "user_bytes": 452,
+      "fresh_prompt_tokens": 481,
+      "outcome": "CONTEXT_REJECTED"
+    }
+  ]
+}

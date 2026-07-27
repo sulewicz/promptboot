@@ -1,0 +1,11 @@
+[package]
+name = "promptboot-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later AND MIT AND (MIT OR Apache-2.0)"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
