@@ -49,10 +49,13 @@ Choose additional validation based on what changed:
 | Change | Command |
 | --- | --- |
 | Host inference | `make validate-host` |
+| Single-core host performance and exact-output gate | `make benchmark-host EVIDENCE_DIR=build/perf-baseline` |
 | Model packing, EFI, or FAT image | `make validate-deterministic` |
 | Firmware behavior under KVM | `make validate-kvm` |
 | Portable emulation | `make validate-tcg` |
 | Several of these areas | `make validate-full` |
+
+`make benchmark-host EVIDENCE_DIR=build/perf-baseline` selects the first logical CPU in the caller's affinity mask, pins the complete run to it, and writes `build/perf-baseline-host/run-report.json`. Set `CPU=<logical-id>` to choose another allowed CPU. The command fails before inference if it cannot establish single-CPU affinity.
 
 ## Release and play
 

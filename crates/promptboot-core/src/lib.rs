@@ -10,11 +10,13 @@ mod tokenizer;
 
 pub use arena::{Arena, ArenaError, ArenaUsage, Region};
 pub use inference::{
-    greedy_token, sample_token, sample_token_with_repetition, top_logits_8, InferenceDomain,
-    InferenceEngine, InferenceError, InferenceFieldKind, InferenceState, InferenceStatus,
-    InferenceStep, InferenceUsage, SamplingState, TopLogit, CONTEXT_LIMIT, KV_BYTES, LOGIT_WORDS,
-    NO_LAYER, NO_TENSOR, SAMPLING_POLICY, SAMPLING_REPETITION_PENALTY_MILLI,
-    SAMPLING_TEMPERATURE_MILLI, SAMPLING_TOP_K, SAMPLING_TOP_P_MILLI, SCRATCH_BYTES,
+    greedy_token, inference_avx2_available, sample_token, sample_token_with_repetition,
+    top_logits_8, inference_worker_entry, InferenceDispatcher, InferenceDomain, InferenceEngine,
+    InferenceError, InferenceFieldKind, InferenceState, InferenceStatus, InferenceStep,
+    InferenceUsage, InferenceWorkerJob, SamplingState, TopLogit,
+    CONTEXT_LIMIT, KV_BYTES, LOGIT_WORDS, NO_LAYER, NO_TENSOR, SAMPLING_POLICY,
+    SAMPLING_REPETITION_PENALTY_MILLI, SAMPLING_TEMPERATURE_MILLI, SAMPLING_TOP_K,
+    SAMPLING_TOP_P_MILLI, SCRATCH_BYTES,
 };
 pub use model::{
     ErrorDomain, FieldKind, Merge, ModelConfig, ModelError, ModelStatus, ModelView, TensorMeta,
@@ -24,6 +26,82 @@ pub use tokenizer::{
     ConversationUsage, FrozenTokenizer, PieceKind, PieceUsage, PromptUsage, TokenizerUsage,
     INDEX_BYTES, TOKENIZER_INDEX_SHA256_HEX,
 };
+
+pub const PROMPT_LIMIT: usize = CONTEXT_LIMIT as usize - 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryDecision {
+    Use { prompt_tokens: usize },
+    RetryFresh,
+    Reset { prompt_tokens: usize },
+    Reject { fresh_prompt_tokens: usize },
+}
+
+pub const fn decide_history(
+    has_history: bool,
+    prospective_tokens: usize,
+    fresh_prompt_tokens: Option<usize>,
+) -> HistoryDecision {
+    if prospective_tokens <= PROMPT_LIMIT {
+        HistoryDecision::Use {
+            prompt_tokens: prospective_tokens,
+        }
+    } else if has_history {
+        match fresh_prompt_tokens {
+            None => HistoryDecision::RetryFresh,
+            Some(fresh_prompt_tokens) if fresh_prompt_tokens <= PROMPT_LIMIT => {
+                HistoryDecision::Reset {
+                    prompt_tokens: fresh_prompt_tokens,
+                }
+            }
+            Some(fresh_prompt_tokens) => HistoryDecision::Reject {
+                fresh_prompt_tokens,
+            },
+        }
+    } else {
+        HistoryDecision::Reject {
+            fresh_prompt_tokens: match fresh_prompt_tokens {
+                Some(value) => value,
+                None => prospective_tokens,
+            },
+        }
+    }
+}
+
+/// Clears committed conversation state before evaluating an already-tokenized
+/// fresh prompt, retaining a validated fixed-prefix position when possible.
+pub fn reset_conversation_for_fresh_prompt(
+    engine: &mut InferenceEngine<'_, '_, '_, '_>,
+    committed: &mut [u32],
+    working: &mut [u32],
+    fresh_prompt_tokens: usize,
+    cached_len: &mut usize,
+    committed_len: &mut usize,
+    history_turns: &mut u32,
+) -> Result<u32, InferenceError> {
+    let retained_position = engine.reset_to_prefix();
+    *cached_len = 0;
+    committed.fill(0);
+    *committed_len = 0;
+    *history_turns = 0;
+
+    let Ok(retained_position) = retained_position else {
+        working.fill(0);
+        let _ = engine.reset();
+        return retained_position;
+    };
+    if fresh_prompt_tokens > working.len() {
+        working.fill(0);
+        engine.reset()?;
+        return Ok(0);
+    }
+    working[fresh_prompt_tokens..].fill(0);
+    if retained_position as usize > fresh_prompt_tokens || engine.position() != retained_position {
+        engine.reset()?;
+        return Ok(0);
+    }
+    Ok(retained_position)
+}
 
 use core::mem::{align_of, size_of};
 use core::ptr;

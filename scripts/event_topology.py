@@ -10,8 +10,8 @@ TOGGLE_V1 = "toggle-v1"
 STRICT_FINAL = "strict_final"
 POLLING_PREFIX = "polling_prefix"
 MODES = (STRICT_FINAL, POLLING_PREFIX)
-STATUS_ON = b"events: on\r\n"
-STATUS_OFF = b"events: off\r\n"
+EVENT_DISPLAY_ON_FRAME = b"\0PROMPTBOOT_EVENTS_ON\0"
+EVENT_DISPLAY_OFF_FRAME = b"\0PROMPTBOOT_EVENTS_OFF\0"
 
 
 class TopologyResult(NamedTuple):
@@ -42,11 +42,19 @@ def _items(
                     continue
                 raise ValueError("incomplete physical event record")
             items.append(("record", record, start + at, end))
-        elif line == STATUS_ON:
-            items.append(("on", line, start, end))
-        elif line == STATUS_OFF:
-            items.append(("off", line, start, end))
         start = end
+    for kind, frame in (
+        ("on", EVENT_DISPLAY_ON_FRAME),
+        ("off", EVENT_DISPLAY_OFF_FRAME),
+    ):
+        start = 0
+        while True:
+            at = payload.find(frame, start)
+            if at < 0:
+                break
+            items.append((kind, frame, at, at + len(frame)))
+            start = at + len(frame)
+    items.sort(key=lambda item: item[2])
     return items
 
 

@@ -32,10 +32,10 @@ const SCRATCH_BYTES: usize = 5_120;
 const STAGED_TOKENS: usize = 0;
 const CURRENT_SEGMENT: usize = 2_396;
 const STAGED_RENDERED: usize = 4_444;
-const MAX_TOKENS: usize = 599;
+pub(crate) const MAX_TOKENS: usize = 599;
 const MAX_SEGMENT: usize = 512;
 const IM_START: u32 = 151_644;
-const IM_END: u32 = 151_645;
+pub(crate) const IM_END: u32 = 151_645;
 const END_OF_TEXT: u32 = 151_643;
 const TOOL_CALL: &[u8] = b"<tool_call>";
 const TOOL_END: &[u8] = b"</tool_call>";
@@ -78,6 +78,7 @@ pub struct TokenizerUsage {
 pub struct PromptUsage {
     pub rendered_bytes: u32,
     pub token_count: u32,
+    pub prefix_tokens: u32,
     pub im_start_count: u32,
     pub im_end_count: u32,
 }
@@ -90,6 +91,18 @@ pub struct ConversationUsage {
     pub fresh_prompt_tokens: u32,
     pub history_tokens: u32,
     pub prompt_tokens: u32,
+    pub prefix_tokens: u32,
+}
+
+impl ConversationUsage {
+    pub const ZERO: Self = Self {
+        rendered_bytes: 0,
+        user_tokens: 0,
+        fresh_prompt_tokens: 0,
+        history_tokens: 0,
+        prompt_tokens: 0,
+        prefix_tokens: 0,
+    };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,9 +122,16 @@ pub struct PieceUsage {
 
 const _: [(); 40] = [(); size_of::<TokenizerUsage>()];
 const _: [(); 8] = [(); align_of::<TokenizerUsage>()];
-const _: [(); 16] = [(); size_of::<PromptUsage>()];
-const _: [(); 20] = [(); size_of::<ConversationUsage>()];
+const _: [(); 20] = [(); size_of::<PromptUsage>()];
+const _: [(); 24] = [(); size_of::<ConversationUsage>()];
 const _: [(); 8] = [(); size_of::<PieceUsage>()];
+
+struct PromptComputation {
+    rendered_bytes: usize,
+    token_count: usize,
+    prefix_tokens: usize,
+    user_tokens: usize,
+}
 
 pub struct FrozenTokenizer<'model, 'bytes, 'index> {
     model: &'model ModelView<'bytes>,
@@ -640,16 +660,18 @@ impl<'model, 'bytes, 'index> FrozenTokenizer<'model, 'bytes, 'index> {
 
         let computation = self.compute_prompt(user, &mut scratch[..SCRATCH_BYTES]);
         match computation {
-            Ok((rendered_count, token_count)) => {
-                rendered[..rendered_count]
-                    .copy_from_slice(&scratch[STAGED_RENDERED..STAGED_RENDERED + rendered_count]);
-                for (at, output) in tokens[..token_count].iter_mut().enumerate() {
+            Ok(computation) => {
+                rendered[..computation.rendered_bytes].copy_from_slice(
+                    &scratch[STAGED_RENDERED..STAGED_RENDERED + computation.rendered_bytes],
+                );
+                for (at, output) in tokens[..computation.token_count].iter_mut().enumerate() {
                     *output = u32_at(scratch, STAGED_TOKENS + at * 4);
                 }
                 scratch[..SCRATCH_BYTES].fill(0);
                 Ok(PromptUsage {
-                    rendered_bytes: rendered_count as u32,
-                    token_count: token_count as u32,
+                    rendered_bytes: computation.rendered_bytes as u32,
+                    token_count: computation.token_count as u32,
+                    prefix_tokens: computation.prefix_tokens as u32,
                     im_start_count: 3,
                     im_end_count: 2,
                 })
@@ -673,6 +695,7 @@ impl<'model, 'bytes, 'index> FrozenTokenizer<'model, 'bytes, 'index> {
         staging_tokens: &mut [u32],
         tokens: &mut [u32],
         scratch: &mut [u8],
+        outcome: &mut ConversationUsage,
     ) -> Result<ConversationUsage, ModelError> {
         if history.len() > CONTEXT_LIMIT as usize {
             return Err(ModelError::new(
@@ -719,14 +742,23 @@ impl<'model, 'bytes, 'index> FrozenTokenizer<'model, 'bytes, 'index> {
         {
             return Err(error);
         }
-        let (rendered_count, fresh_count) =
-            match self.compute_prompt(user, &mut scratch[..SCRATCH_BYTES]) {
-                Ok(value) => value,
-                Err(error) => {
-                    scratch[..SCRATCH_BYTES].fill(0);
-                    return Err(error);
-                }
-            };
+        let computation = match self.compute_prompt(user, &mut scratch[..SCRATCH_BYTES]) {
+            Ok(value) => value,
+            Err(error) => {
+                scratch[..SCRATCH_BYTES].fill(0);
+                return Err(error);
+            }
+        };
+        let rendered_count = computation.rendered_bytes;
+        let fresh_count = computation.token_count;
+        *outcome = ConversationUsage {
+            rendered_bytes: rendered_count as u32,
+            user_tokens: computation.user_tokens as u32,
+            fresh_prompt_tokens: fresh_count as u32,
+            history_tokens: history.len() as u32,
+            prompt_tokens: 0,
+            prefix_tokens: computation.prefix_tokens as u32,
+        };
         let suffix_start = if history.is_empty() {
             0
         } else {
@@ -776,6 +808,7 @@ impl<'model, 'bytes, 'index> FrozenTokenizer<'model, 'bytes, 'index> {
                 ));
             }
         };
+        outcome.prompt_tokens = u32::try_from(prospective).unwrap_or(u32::MAX);
         if prospective > CONTEXT_LIMIT as usize {
             scratch[..SCRATCH_BYTES].fill(0);
             return Err(ModelError::new(
@@ -803,20 +836,14 @@ impl<'model, 'bytes, 'index> FrozenTokenizer<'model, 'bytes, 'index> {
             .copy_from_slice(&staging_tokens[suffix_start..fresh_count]);
         staging_tokens[..MAX_TOKENS].fill(0);
         scratch[..SCRATCH_BYTES].fill(0);
-        Ok(ConversationUsage {
-            rendered_bytes: rendered_count as u32,
-            user_tokens: fresh_count.saturating_sub(29) as u32,
-            fresh_prompt_tokens: fresh_count as u32,
-            history_tokens: history.len() as u32,
-            prompt_tokens: prospective as u32,
-        })
+        Ok(*outcome)
     }
 
     fn compute_prompt(
         &self,
         user: &[u8],
         scratch: &mut [u8],
-    ) -> Result<(usize, usize), ModelError> {
+    ) -> Result<PromptComputation, ModelError> {
         let before = b"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
         let after = b"<|im_end|>\n<|im_start|>assistant\n";
         let rendered_count = before.len() + user.len() + after.len();
@@ -852,13 +879,20 @@ impl<'model, 'bytes, 'index> FrozenTokenizer<'model, 'bytes, 'index> {
         self.control(scratch, &mut count, IM_START)?;
         self.ordinary(scratch, &mut count, b"user")?;
         self.ordinary(scratch, &mut count, b"\n")?;
+        let prefix_tokens = count;
         self.ordinary(scratch, &mut count, user)?;
+        let user_tokens = count - prefix_tokens;
         self.control(scratch, &mut count, IM_END)?;
         self.ordinary(scratch, &mut count, b"\n")?;
         self.control(scratch, &mut count, IM_START)?;
         self.ordinary(scratch, &mut count, b"assistant")?;
         self.ordinary(scratch, &mut count, b"\n")?;
-        Ok((rendered_count, count))
+        Ok(PromptComputation {
+            rendered_bytes: rendered_count,
+            token_count: count,
+            prefix_tokens,
+            user_tokens,
+        })
     }
 
     fn control(&self, scratch: &mut [u8], count: &mut usize, token: u32) -> Result<(), ModelError> {

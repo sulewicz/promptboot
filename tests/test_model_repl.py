@@ -86,6 +86,49 @@ class ModelReplContractTests(unittest.TestCase):
         additive = valid.removesuffix(b"\r\n") + b" diagnostic=useful\r\n"
         self.runner.validate_record_schemas([valid, reordered, additive])
 
+    def test_runtime_status_schema_and_status_row_mask_are_explicit(self):
+        record = (
+            b"PROMPTBOOT_EVENT v=1 event=RUNTIME_STATUS state=waiting "
+            b"cpu_mode=serial cpu_active=1 cpu_workers=0 cpu_enabled=2 cpu_total=2 "
+            b"memory_baseline=100 memory_free=80 memory_consumed_since_boot=20 "
+            b"committed_tokens=0 engine_position=0 context_limit=32768 "
+            b"generation_reserve=0\r\n"
+        )
+        self.runner.validate_record_schemas([record])
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(temporary) / "first.ppm"
+            second = Path(temporary) / "second.ppm"
+            header = b"P6\n80 25\n255\n"
+            pixels = bytearray(80 * 25 * 3)
+            first.write_bytes(header + pixels)
+            pixels[13 * 3] = 255
+            second.write_bytes(header + pixels)
+            self.assertEqual(
+                self.runner.masked_screen_digest(first),
+                self.runner.masked_screen_digest(second),
+            )
+            self.assertEqual(
+                self.runner.status_row_digest(first),
+                self.runner.status_row_digest(second),
+            )
+            pixels[0] = 255
+            second.write_bytes(header + pixels)
+            self.assertNotEqual(
+                self.runner.status_row_digest(first),
+                self.runner.status_row_digest(second),
+            )
+        status = (
+            b"\x1b[001;001H\x1b[0m\x1b[30m\x1b[47m"
+            b" promptboot [/] inferring | CPU 1/1 | MEM 8 MiB free | CTX 1/32768"
+            b"\x1b[0m\x1b[37m\x1b[40m\x1b[002;004H"
+        )
+        self.assertEqual(
+            self.runner.normalize_human_stream(
+                b"\x1b[002;001HOne" + status + b" color.\r\n"
+            ),
+            b"One color.\r\n",
+        )
+
     def test_live_wait_and_selection_match_semantic_fields(self):
         record = (
             b"PROMPTBOOT_EVENT v=1 diagnostic=useful history_tokens=0 "
@@ -147,12 +190,14 @@ class ModelReplContractTests(unittest.TestCase):
         record_a = b"PROMPTBOOT_EVENT v=1 event=A\r\n"
         record_b = b"PROMPTBOOT_EVENT v=1 event=B\r\n"
         record_c = b"PROMPTBOOT_EVENT v=1 event=C\r\n"
+        on = self.topology.EVENT_DISPLAY_ON_FRAME
+        off = self.topology.EVENT_DISPLAY_OFF_FRAME
         valid = (
             record_a
-            + b"events: on\r\n"
+            + on
             + record_b
             + record_b
-            + b"events: off\r\n"
+            + off
             + record_c
         )
         parsed = self.topology.parse_records(
@@ -161,19 +206,71 @@ class ModelReplContractTests(unittest.TestCase):
         self.assertEqual(parsed.logical_records, (record_a, record_b, record_c))
         self.assertEqual(parsed.physical_records, (record_a, record_b, record_b, record_c))
         self.assertIsNone(parsed.pending_record)
+        for ordinary in (
+            b"model says events: on\r\n",
+            b"events: on is a command\r\n",
+            b"model says \x1b[001;001Hevents: on\r\n",
+            b"model says \x1b[001;001Hevents: off\r\n",
+            b"\x1b[001;002Hevents: on\r\n",
+            b"model says events: off\r\n",
+            on[1:],
+            on[:-1],
+            b"\0xPROMPTBOOT_EVENTS_ON\0",
+            b"\0PROMPTBOOT_EVENTS_ONx\0",
+            b"\0promptboot_events_on\0",
+            off[1:],
+            off[:-1],
+            b"\0xPROMPTBOOT_EVENTS_OFF\0",
+            b"\0PROMPTBOOT_EVENTS_OFFx\0",
+        ):
+            parsed = self.topology.parse_records(
+                record_a + ordinary + record_c,
+                self.topology.TOGGLE_V1,
+                self.topology.STRICT_FINAL,
+            )
+            self.assertEqual(parsed.logical_records, (record_a, record_c))
+        for malformed_on in (
+            on[1:],
+            on[:-1],
+            b"\0xPROMPTBOOT_EVENTS_ON\0",
+            b"\0PROMPTBOOT_EVENTS_ONx\0",
+        ):
+            with self.assertRaises(ValueError):
+                self.topology.parse_records(
+                    record_a + malformed_on + record_b + record_b + record_c,
+                    self.topology.TOGGLE_V1,
+                    self.topology.STRICT_FINAL,
+                )
+        for malformed_off in (
+            off[1:],
+            off[:-1],
+            b"\0xPROMPTBOOT_EVENTS_OFF\0",
+            b"\0PROMPTBOOT_EVENTS_OFFx\0",
+        ):
+            with self.assertRaises(ValueError):
+                self.topology.parse_records(
+                    record_a
+                    + on
+                    + record_b
+                    + record_b
+                    + malformed_off
+                    + record_c,
+                    self.topology.TOGGLE_V1,
+                    self.topology.STRICT_FINAL,
+                )
         for payload in (
             record_a + record_a,
-            b"events: on\r\n" + record_b + record_c,
-            b"events: on\r\n" + record_b + b"x" + record_b,
-            b"events: off\r\n" + record_a,
-            b"events: on\r\n" + record_b,
+            on + record_b + record_c,
+            on + record_b + b"x" + record_b,
+            off + record_a,
+            on + record_b,
         ):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 self.topology.parse_records(
                     payload, self.topology.TOGGLE_V1, self.topology.STRICT_FINAL
                 )
         polling = self.topology.parse_records(
-            b"events: on\r\n" + record_b,
+            on + record_b,
             self.topology.TOGGLE_V1,
             self.topology.POLLING_PREFIX,
         )

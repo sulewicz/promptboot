@@ -14,8 +14,11 @@ pub fn is_new_command(line: &[u8]) -> bool {
     line == b"/new"
 }
 
+pub fn is_status_command(line: &[u8]) -> bool {
+    line == b"/status"
+}
+
 pub const GENERATION_RESERVE: usize = 1_024;
-pub const PROMPT_LIMIT: usize = CONTEXT_TOKENS - 1;
 pub const REPETITION_BITMAP_BYTES: usize = promptboot_core::LOGIT_WORDS.div_ceil(8);
 pub const SESSION_BYTES: usize = CONTEXT_TOKENS * 2 * core::mem::size_of::<u32>()
     + GENERATION_RESERVE * 48
@@ -38,44 +41,7 @@ pub const fn selected_token_failure(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HistoryDecision {
-    Use { prompt_tokens: usize },
-    RetryFresh,
-    Reset { prompt_tokens: usize },
-    Reject { fresh_prompt_tokens: usize },
-}
-
-pub const fn decide_history(
-    has_history: bool,
-    prospective_tokens: usize,
-    fresh_prompt_tokens: Option<usize>,
-) -> HistoryDecision {
-    if prospective_tokens <= PROMPT_LIMIT {
-        HistoryDecision::Use {
-            prompt_tokens: prospective_tokens,
-        }
-    } else if has_history {
-        match fresh_prompt_tokens {
-            None => HistoryDecision::RetryFresh,
-            Some(fresh_prompt_tokens) if fresh_prompt_tokens <= PROMPT_LIMIT => {
-                HistoryDecision::Reset {
-                    prompt_tokens: fresh_prompt_tokens,
-                }
-            }
-            Some(fresh_prompt_tokens) => HistoryDecision::Reject {
-                fresh_prompt_tokens,
-            },
-        }
-    } else {
-        HistoryDecision::Reject {
-            fresh_prompt_tokens: match fresh_prompt_tokens {
-                Some(value) => value,
-                None => prospective_tokens,
-            },
-        }
-    }
-}
+pub use promptboot_core::{decide_history, HistoryDecision, PROMPT_LIMIT};
 
 pub fn commit_eos(
     committed: &mut [u32; CONTEXT_TOKENS],
@@ -294,9 +260,11 @@ mod tests {
         assert!(is_event_toggle_command(b"/events"));
         assert!(is_help_command(b"/help"));
         assert!(is_new_command(b"/new"));
+        assert!(is_status_command(b"/status"));
         assert!(!is_event_toggle_command(b"/events "));
         assert!(!is_help_command(b"/helps"));
         assert!(!is_new_command(b"/new "));
+        assert!(!is_status_command(b"/status "));
     }
 
     #[test]
@@ -324,11 +292,7 @@ mod tests {
             }
         );
         assert_eq!(
-            decide_history(
-                true,
-                PROMPT_LIMIT + 1,
-                Some(PROMPT_LIMIT + 1),
-            ),
+            decide_history(true, PROMPT_LIMIT + 1, Some(PROMPT_LIMIT + 1),),
             HistoryDecision::Reject {
                 fresh_prompt_tokens: PROMPT_LIMIT + 1
             }

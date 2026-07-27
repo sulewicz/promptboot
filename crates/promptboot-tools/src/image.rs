@@ -70,9 +70,11 @@ const INPUT_PATHS: &[&str] = &[
     "src/lib.rs",
     "src/main.rs",
     "src/model_contract.rs",
+    "src/mp_inference.rs",
     "src/model_repl.rs",
     "src/model_target.rs",
     "src/repl_contract.rs",
+    "src/status_bar.rs",
 ];
 
 #[derive(Clone)]
@@ -1354,6 +1356,7 @@ mod tests {
     fn production_input_closure_is_native_and_sorted_by_builder() {
         assert!(INPUT_PATHS.contains(&"crates/promptboot-tools/src/image.rs"));
         assert!(INPUT_PATHS.contains(&"src/console_history.rs"));
+        assert!(INPUT_PATHS.contains(&"src/mp_inference.rs"));
         assert!(INPUT_PATHS.contains(&"src/model_repl.rs"));
         assert!(!INPUT_PATHS.iter().any(|path| path.contains("model_fat16")));
         assert!(!INPUT_PATHS

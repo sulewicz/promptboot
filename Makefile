@@ -6,7 +6,7 @@ ACCEL ?= kvm
 MODEL_OUTPUT ?= build/model/qwen2.5-0.5b-instruct.pbtqw25
 INSPECTION_OUTPUT ?= build/model/inspection.json
 
-.PHONY: help setup verify-assets dev pack-model inspect-model release play validate-host validate-deterministic validate-kvm validate-tcg validate-full usb
+.PHONY: help setup verify-assets dev pack-model inspect-model release play validate-host benchmark-host validate-deterministic validate-kvm validate-tcg validate-full usb
 
 help:
 	@printf '%s\n' \
@@ -20,6 +20,7 @@ help:
 	  '  make release                   Build or verify the current-HEAD release' \
 	  '  make play                      Run the interactive production REPL in QEMU' \
 	  '  make validate-host             Validate host-side inference' \
+	  '  make benchmark-host            Run the pinned single-core host baseline' \
 	  '  make validate-deterministic    Build and compare two model images' \
 	  '  make validate-kvm              Validate the selected release with KVM' \
 	  '  make validate-tcg              Validate the selected release with TCG' \
@@ -30,6 +31,7 @@ help:
 	  '  RELEASE_DIR=<path>             Release below build/ (default: build/release-<HEAD>)' \
 	  '  EVIDENCE_DIR=<path>            Validation output prefix (default: build/validation-<HEAD>)' \
 	  '  ACCEL=kvm|tcg                  QEMU accelerator for play (default: kvm)' \
+	  '  CPU=<logical-id>               Optional host benchmark CPU (default: first allowed)' \
 	  '  DEVICE=/dev/...                Required whole-disk target for usb'
 
 setup:
@@ -63,6 +65,9 @@ play:
 
 validate-host:
 	@./tests/integration/validate_model_host.sh
+
+benchmark-host:
+	@CPU="$(CPU)" MODEL_OUTPUT="$(MODEL_OUTPUT)" ./tests/integration/benchmark_model_host.sh "$(EVIDENCE_DIR)-host"
 
 validate-deterministic:
 	@./tests/integration/validate_model_deterministic.sh "$(EVIDENCE_DIR)-deterministic"

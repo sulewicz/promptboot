@@ -1,10 +1,21 @@
 //! Small dependency-free SHA-256 used to authenticate the frozen model image.
 
+use core::arch::global_asm;
+use core::arch::x86_64::{__cpuid, __cpuid_count};
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Backend {
+    Unresolved,
+    Scalar,
+    ShaNi,
+}
+
 pub struct Sha256 {
     state: [u32; 8],
     block: [u8; 64],
     used: usize,
     bytes: u64,
+    backend: Backend,
 }
 
 const K: [u32; 64] = [
@@ -28,6 +39,7 @@ impl Sha256 {
             block: [0; 64],
             used: 0,
             bytes: 0,
+            backend: Backend::Unresolved,
         }
     }
 
@@ -79,46 +91,174 @@ impl Sha256 {
     }
 
     fn compress(&mut self, block: &[u8; 64]) {
-        let mut w = [0u32; 64];
-        for (index, chunk) in block.chunks_exact(4).enumerate() {
-            w[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if self.backend == Backend::Unresolved {
+            self.backend = if sha_ni_available() {
+                Backend::ShaNi
+            } else {
+                Backend::Scalar
+            };
         }
-        for index in 16..64 {
-            let s0 = w[index - 15].rotate_right(7)
-                ^ w[index - 15].rotate_right(18)
-                ^ (w[index - 15] >> 3);
-            let s1 = w[index - 2].rotate_right(17)
-                ^ w[index - 2].rotate_right(19)
-                ^ (w[index - 2] >> 10);
-            w[index] = w[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[index - 7])
-                .wrapping_add(s1);
+        let schedule = message_schedule(block);
+        match self.backend {
+            Backend::Scalar => compress_scalar(&mut self.state, &schedule),
+            Backend::ShaNi => unsafe { compress_sha_ni(&mut self.state, &schedule) },
+            Backend::Unresolved => unreachable!(),
         }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
-        for index in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choice = (e & f) ^ ((!e) & g);
-            let t1 = h
-                .wrapping_add(s1)
-                .wrapping_add(choice)
-                .wrapping_add(K[index])
-                .wrapping_add(w[index]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(majority);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        match self.backend {
+            Backend::Unresolved => "unresolved",
+            Backend::Scalar => "scalar",
+            Backend::ShaNi => "sha_ni",
         }
-        for (state, value) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *state = state.wrapping_add(value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_scalar_for_test(&mut self) {
+        assert!(self.backend == Backend::Unresolved);
+        self.backend = Backend::Scalar;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_sha_ni_for_test(&mut self) -> bool {
+        assert!(self.backend == Backend::Unresolved);
+        if sha_ni_available() {
+            self.backend = Backend::ShaNi;
+            true
+        } else {
+            false
         }
+    }
+}
+
+pub fn sha_ni_available() -> bool {
+    let max_basic_leaf = __cpuid(0).eax;
+    let leaf7_ebx = if max_basic_leaf >= 7 {
+        __cpuid_count(7, 0).ebx
+    } else {
+        0
+    };
+    select_sha_ni(max_basic_leaf, leaf7_ebx)
+}
+
+fn select_sha_ni(max_basic_leaf: u32, leaf7_ebx: u32) -> bool {
+    max_basic_leaf >= 7 && leaf7_ebx & (1 << 29) != 0
+}
+
+fn message_schedule(block: &[u8; 64]) -> [u32; 64] {
+    let mut schedule = [0u32; 64];
+    for (index, chunk) in block.chunks_exact(4).enumerate() {
+        schedule[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    for index in 16..64 {
+        let s0 = schedule[index - 15].rotate_right(7)
+            ^ schedule[index - 15].rotate_right(18)
+            ^ (schedule[index - 15] >> 3);
+        let s1 = schedule[index - 2].rotate_right(17)
+            ^ schedule[index - 2].rotate_right(19)
+            ^ (schedule[index - 2] >> 10);
+        schedule[index] = schedule[index - 16]
+            .wrapping_add(s0)
+            .wrapping_add(schedule[index - 7])
+            .wrapping_add(s1);
+    }
+    schedule
+}
+
+fn compress_scalar(state: &mut [u32; 8], schedule: &[u32; 64]) {
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for index in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let choice = (e & f) ^ ((!e) & g);
+        let t1 = h
+            .wrapping_add(s1)
+            .wrapping_add(choice)
+            .wrapping_add(K[index])
+            .wrapping_add(schedule[index]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let majority = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(majority);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    for (word, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+        *word = word.wrapping_add(value);
+    }
+}
+
+#[target_feature(enable = "sha,sse2")]
+unsafe fn compress_sha_ni(state: &mut [u32; 8], schedule: &[u32; 64]) {
+    let mut round_words = [0u32; 64];
+    for index in 0..64 {
+        round_words[index] = schedule[index].wrapping_add(K[index]);
+    }
+    promptboot_sha256_rounds(state.as_mut_ptr(), round_words.as_ptr());
+}
+
+unsafe extern "sysv64" {
+    fn promptboot_sha256_rounds(state: *mut u32, round_words: *const u32);
+}
+
+global_asm!(
+    r#"
+    .text
+    .p2align 4
+    .globl promptboot_sha256_rounds
+promptboot_sha256_rounds:
+    movdqu xmm1, xmmword ptr [rdi]
+    movdqu xmm2, xmmword ptr [rdi + 16]
+    pshufd xmm3, xmm1, 0xb1
+    pshufd xmm2, xmm2, 0x1b
+    movdqa xmm1, xmm2
+    psrldq xmm1, 8
+    movdqa xmm6, xmm3
+    pslldq xmm6, 8
+    por xmm1, xmm6
+    movdqa xmm6, xmm3
+    psrldq xmm6, 8
+    punpcklqdq xmm2, xmm6
+    movdqa xmm4, xmm1
+    movdqa xmm5, xmm2
+    xor eax, eax
+1:
+    movdqu xmm0, xmmword ptr [rsi + rax]
+    sha256rnds2 xmm2, xmm1
+    pshufd xmm0, xmm0, 0x0e
+    sha256rnds2 xmm1, xmm2
+    add eax, 16
+    cmp eax, 256
+    jne 1b
+    paddd xmm1, xmm4
+    paddd xmm2, xmm5
+    pshufd xmm3, xmm1, 0x1b
+    pshufd xmm2, xmm2, 0xb1
+    movdqa xmm6, xmm3
+    psrldq xmm6, 8
+    punpcklqdq xmm6, xmm2
+    psrldq xmm2, 8
+    punpcklqdq xmm3, xmm2
+    movdqu xmmword ptr [rdi], xmm3
+    movdqu xmmword ptr [rdi + 16], xmm6
+    ret
+"#
+);
+
+#[cfg(test)]
+mod backend_tests {
+    use super::select_sha_ni;
+
+    #[test]
+    fn cpuid_selection_requires_leaf7_sha_bit() {
+        assert!(!select_sha_ni(6, 1 << 29));
+        assert!(!select_sha_ni(7, 0));
+        assert!(select_sha_ni(7, 1 << 29));
     }
 }
 

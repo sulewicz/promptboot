@@ -1,36 +1,120 @@
 //! Resident persistent-UEFI model REPL over the shared loaded model/session.
 
+use core::ffi::c_void;
 use core::mem::transmute;
+use core::ptr::null;
 use core::slice;
 
 use promptboot::console_contract::{
-    is_generation_interrupt, read_result, reset_result, validate_bindings, wait_result,
+    is_generation_interrupt, read_result, reset_result, validate_bindings,
 };
 use promptboot::editor::{Editor, Flow, Output};
 use promptboot::repl_contract::{
     commit_eos, decide_history, is_event_toggle_command, is_help_command, is_new_command,
-    render_console_text, selected_token_failure, HistoryDecision, Utf8Decoder, Utf8Error,
-    CONTEXT_TOKENS, GENERATION_RESERVE, IM_END, PROMPT_LIMIT, REPETITION_BITMAP_BYTES,
-    SESSION_BYTES,
+    is_status_command, render_console_text, selected_token_failure, HistoryDecision, Utf8Decoder,
+    Utf8Error, CONTEXT_TOKENS, GENERATION_RESERVE, IM_END, PROMPT_LIMIT,
+    REPETITION_BITMAP_BYTES, SESSION_BYTES,
+};
+use promptboot::status_bar::{
+    cleanup_periodic_timer, inference_status_due, measure_status_memory, primary_or_cleanup,
+    runtime_line, start_periodic_timer, wait_key_first, waiting_render_failure_is_terminal,
+    with_runtime_memory, CpuTopology, RuntimeMemoryFailure, RuntimeSnapshot, RuntimeState,
+    TimerFailure, TurnCompletion, WaitSource,
 };
 use promptboot_core::{
-    sample_token_with_repetition, FrozenTokenizer, InferenceEngine, InferenceError, ModelError,
-    ModelView, PieceKind, SamplingState, INDEX_BYTES, KV_BYTES, LOGIT_WORDS, SAMPLING_POLICY,
-    SCRATCH_BYTES, TOKENIZER_INDEX_SHA256_HEX,
+    reset_conversation_for_fresh_prompt, sample_token_with_repetition, ConversationUsage,
+    FrozenTokenizer, InferenceEngine, InferenceError, ModelError, ModelView, PieceKind,
+    SamplingState, INDEX_BYTES, KV_BYTES, LOGIT_WORDS, SAMPLING_POLICY, SCRATCH_BYTES,
+    TOKENIZER_INDEX_SHA256_HEX,
 };
 
 use super::model_target::{timing_end, timing_start, Failure, Timing, EXPECTED_SHA_HEX};
 use super::{
-    emit_record_checked, establish_fp_state, reset_console_history, restore_fp_state,
-    scroll_console_page, toggle_event_display, write_conout_utf16_checked, BootServices, EfiHandle,
+    emit_record_checked, establish_fp_state, measure_conventional_memory, render_status_ascii,
+    reset_console_history, restore_fp_state, scroll_console_page, toggle_event_display,
+    write_conout_utf16_checked, write_serial_checked, BootServices, EfiEvent, EfiHandle,
     EfiInputKey, EfiKeyData, EfiKeyState, EfiStatus, InputReset, ReadKeyStroke, ReadKeyStrokeEx,
     Record, SimpleTextInput, SimpleTextInputEx, SystemTable, WaitForEvent, EFI_DEVICE_ERROR,
-    EFI_OPEN_PROTOCOL_GET_PROTOCOL, EFI_SUCCESS, SAVED_FP_STATE, SIMPLE_TEXT_INPUT_EX_GUID,
+    EFI_OPEN_PROTOCOL_GET_PROTOCOL, EFI_SUCCESS, EVT_TIMER, SAVED_FP_STATE,
+    SIMPLE_TEXT_INPUT_EX_GUID, TPL_APPLICATION,
 };
 
 const SCAN_PAGE_UP: u16 = 0x0009;
 const SCAN_PAGE_DOWN: u16 = 0x000a;
 const FALLBACK_SAMPLING_SEED: u64 = 0x6d6f_6465_6c2d_6f73;
+const EVENT_DISPLAY_ON_FRAME: &[u8] = b"\0PROMPTBOOT_EVENTS_ON\0";
+const EVENT_DISPLAY_OFF_FRAME: &[u8] = b"\0PROMPTBOOT_EVENTS_OFF\0";
+
+struct ReplTimer {
+    boot: *mut BootServices,
+    event: EfiEvent,
+}
+
+impl ReplTimer {
+    unsafe fn create(boot: *mut BootServices) -> Result<Self, Failure> {
+        if (*boot).create_event as usize == 0
+            || (*boot).set_timer as usize == 0
+            || (*boot).close_event as usize == 0
+        {
+            return Err(Failure::simple(b"STATUS_TIMER_BINDING", b"status"));
+        }
+        let event = start_periodic_timer(
+            || {
+                let mut event = core::ptr::null_mut();
+                restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+                let status = ((*boot).create_event)(
+                    EVT_TIMER,
+                    TPL_APPLICATION,
+                    null::<c_void>(),
+                    null::<c_void>(),
+                    &mut event,
+                );
+                if status != EFI_SUCCESS {
+                    Err(status)
+                } else if event.is_null() {
+                    Err(EFI_DEVICE_ERROR)
+                } else {
+                    Ok(event)
+                }
+            },
+            |event, mode, period| {
+                restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+                ((*boot).set_timer)(event, mode, period)
+            },
+            |event| {
+                restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+                ((*boot).close_event)(event)
+            },
+        )
+        .map_err(timer_failure)?;
+        Ok(Self { boot, event })
+    }
+
+    unsafe fn cleanup(self) -> Result<(), Failure> {
+        cleanup_periodic_timer(
+            self.event,
+            |event, mode, period| {
+                restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+                ((*self.boot).set_timer)(event, mode, period)
+            },
+            |event| {
+                restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+                ((*self.boot).close_event)(event)
+            },
+        )
+        .map_err(timer_failure)
+    }
+}
+
+fn timer_failure(error: TimerFailure) -> Failure {
+    let (code, status) = match error {
+        TimerFailure::Create(status) => (b"STATUS_TIMER_CREATE" as &'static [u8], status),
+        TimerFailure::Set(status) => (b"STATUS_TIMER_SET" as &'static [u8], status),
+        TimerFailure::Cancel(status) => (b"STATUS_TIMER_CANCEL" as &'static [u8], status),
+        TimerFailure::Close(status) => (b"STATUS_TIMER_CLOSE" as &'static [u8], status),
+    };
+    Failure::efi(code, b"status", status)
+}
 
 #[derive(Clone, Copy)]
 struct TraceEntry {
@@ -176,6 +260,7 @@ pub(super) unsafe fn run(
     tokenizer: &FrozenTokenizer<'_, '_, '_>,
     addresses: [u64; 6],
     timing: Timing,
+    memory_baseline: u64,
 ) -> Result<(), Failure> {
     let con_in = (*system_table).con_in;
     let (reset_entry, read_entry, wait_for_key) = if con_in.is_null() {
@@ -233,10 +318,18 @@ pub(super) unsafe fn run(
         .map_err(|_| Failure::simple(b"HISTORY_STATE", b"history"))?;
     let kv = slice::from_raw_parts_mut(addresses[2] as *mut u8, KV_BYTES);
     let inference_scratch = slice::from_raw_parts_mut(addresses[3] as *mut u8, SCRATCH_BYTES);
+    let mut cpu = CpuTopology::UNKNOWN_SERIAL;
+    let mut mp_adapter = super::mp_inference::MpInferenceAdapter::prepare(boot, &mut cpu);
+    let dispatcher = match mp_adapter.as_mut() {
+        Some(adapter) => Some(adapter.dispatcher()),
+        None => None,
+    };
     establish_fp_state();
-    let engine = InferenceEngine::build(model, kv, inference_scratch);
+    let engine = InferenceEngine::build(model, kv, inference_scratch, dispatcher);
     restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
     let engine = engine.map_err(|error| Failure::inference(b"ENGINE_BUILD", b"engine", error))?;
+    let memory_free = measure_status_memory(|| measure_conventional_memory(boot))
+        .map_err(|_| Failure::simple(b"STATUS_MEMORY", b"status"))?;
     let (seed, seed_source) = sampling_seed();
     let sampling = SamplingState::new(seed);
     let mut controller = ModelReplController {
@@ -244,6 +337,12 @@ pub(super) unsafe fn run(
         engine,
         timing,
         addresses,
+        boot,
+        cpu,
+        memory_baseline,
+        memory_free,
+        state: RuntimeState::Waiting,
+        activity_frame: 0,
         con_in,
         read_key,
         input_ex,
@@ -262,26 +361,64 @@ pub(super) unsafe fn run(
     controller.emit_repl_ready()?;
     write_ascii_checked(b"Ctrl-C stops generation; /help lists commands.\r\n")
         .map_err(|status| Failure::efi(b"CONOUT_WRITE", b"output", status))?;
+    controller
+        .render_status()
+        .map_err(|status| Failure::efi(b"STATUS_RENDER", b"status", status))?;
 
     let wait: WaitForEvent = transmute((*boot).wait_for_event);
-    let event = [wait_for_key];
     let mut editor = Editor::new();
     controller.prompt(editor.prompt_index());
     if let Some(failure) = controller.terminal.take() {
         return Err(failure);
     }
+    let timer = ReplTimer::create(boot)?;
+    let outcome = run_input_loop(
+        &mut controller,
+        &mut editor,
+        wait,
+        wait_for_key,
+        timer.event,
+    );
+    let cleanup = timer.cleanup();
+    primary_or_cleanup(outcome, cleanup)
+}
+
+unsafe fn run_input_loop(
+    controller: &mut ModelReplController<'_, '_, '_, '_, '_>,
+    editor: &mut Editor,
+    wait: WaitForEvent,
+    key_event: EfiEvent,
+    timer_event: EfiEvent,
+) -> Result<(), Failure> {
     loop {
-        let mut index = usize::MAX;
-        restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
-        wait_result(wait(1, event.as_ptr(), &mut index), index)
-            .map_err(|error| Failure::simple(error.code(), b"repl_input"))?;
+        match wait_key_first(key_event, timer_event, |events, index| {
+            restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+            wait(events.len(), events.as_ptr(), index)
+        }) {
+            Ok(WaitSource::Timer) => {
+                controller.waiting_tick()?;
+                continue;
+            }
+            Ok(WaitSource::Key) => {}
+            Err(error) => {
+                return Err(Failure::efi(
+                    b"CONSOLE_WAIT",
+                    b"repl_input",
+                    if error == usize::MAX {
+                        EFI_DEVICE_ERROR
+                    } else {
+                        error
+                    },
+                ));
+            }
+        }
         loop {
             let mut key = EfiInputKey {
                 scan_code: 0,
                 unicode_char: 0,
             };
             restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
-            match read_result(read_key(con_in, &mut key)) {
+            match read_result((controller.read_key)(controller.con_in, &mut key)) {
                 Ok(true) => {
                     if key.unicode_char == 0
                         && (key.scan_code == SCAN_PAGE_UP || key.scan_code == SCAN_PAGE_DOWN)
@@ -290,7 +427,7 @@ pub(super) unsafe fn run(
                             .map_err(|_| Failure::simple(b"CONOUT_SCROLL", b"output"))?;
                         continue;
                     }
-                    if editor.process_key(key.unicode_char, &mut controller)
+                    if editor.process_key(key.unicode_char, controller)
                         == Flow::PromptIndexOverflow
                     {
                         return Err(Failure::simple(b"PROMPT_INDEX", b"repl_input"));
@@ -311,6 +448,12 @@ struct ModelReplController<'a, 'bytes, 'index, 'kv, 'scratch> {
     engine: InferenceEngine<'a, 'bytes, 'kv, 'scratch>,
     timing: Timing,
     addresses: [u64; 6],
+    boot: *mut BootServices,
+    cpu: CpuTopology,
+    memory_baseline: u64,
+    memory_free: u64,
+    state: RuntimeState,
+    activity_frame: u8,
     con_in: *mut SimpleTextInput,
     read_key: ReadKeyStroke,
     input_ex: Option<(*mut SimpleTextInputEx, ReadKeyStrokeEx)>,
@@ -333,6 +476,145 @@ const CONTROLLER_STACK_STATIC_BYTES: usize = core::mem::size_of::<
 const _: [(); 1] = [(); (CONTROLLER_STACK_STATIC_BYTES <= 4_096) as usize];
 
 impl ModelReplController<'_, '_, '_, '_, '_> {
+    fn snapshot(&self) -> RuntimeSnapshot {
+        let usage = self.engine.usage();
+        RuntimeSnapshot {
+            state: self.state,
+            cpu: self.cpu,
+            memory_baseline: self.memory_baseline,
+            memory_free: self.memory_free,
+            committed_tokens: self.committed_len as u32,
+            engine_position: usage.position,
+            context_limit: usage.context_limit,
+            generation_reserve: usage.generation_reserve,
+        }
+    }
+
+    unsafe fn render_status(&self) -> Result<(), EfiStatus> {
+        let mut line = [0u8; promptboot::console_history::MAX_COLUMNS - 1];
+        let length = runtime_line(self.snapshot(), self.activity_frame, &mut line);
+        render_status_ascii(&line[..length])
+    }
+
+    unsafe fn set_state(&mut self, state: RuntimeState) -> Result<(), EfiStatus> {
+        self.state = state;
+        self.render_status()
+    }
+
+    unsafe fn waiting_tick(&mut self) -> Result<(), Failure> {
+        if self.state == RuntimeState::Waiting {
+            self.activity_frame = self.activity_frame.wrapping_add(1);
+            self.render_status()
+                .map_err(|status| Failure::efi(b"STATUS_RENDER", b"status", status))?;
+        }
+        Ok(())
+    }
+
+    unsafe fn inference_step_complete(
+        &mut self,
+        completed_tokens: usize,
+    ) -> Result<(), TurnError> {
+        if !inference_status_due(completed_tokens) {
+            return Ok(());
+        }
+        self.activity_frame = self.activity_frame.wrapping_add(1);
+        self.render_status()
+            .map_err(|status| TurnError::efi(b"STATUS_RENDER", b"status", status))
+    }
+
+    unsafe fn emit_runtime_status(&mut self) -> Result<(), Failure> {
+        let boot = self.boot;
+        let mut snapshot = self.snapshot();
+        let (memory_free, ()) = with_runtime_memory(
+            || measure_conventional_memory(boot),
+            |memory_free| {
+                snapshot.memory_free = memory_free;
+
+                write_ascii_checked(b"\r\nstatus:\r\n")
+                    .map_err(|status| Failure::efi(b"CONOUT_WRITE", b"output", status))?;
+                let mut text = Record::new();
+                text.push(b"  state: ");
+                text.push(snapshot.state.label());
+                text.push(b"\r\n");
+                write_status_text(&text)?;
+                text = Record::new();
+                text.push(b"  cpu: mode=");
+                text.push(snapshot.cpu.mode.label());
+                text.push(b" active=");
+                text.push_decimal(snapshot.cpu.active as u64);
+                text.push(b" workers=");
+                text.push_decimal(snapshot.cpu.workers as u64);
+                text.push(b" enabled=");
+                push_optional(&mut text, snapshot.cpu.enabled);
+                text.push(b" total=");
+                push_optional(&mut text, snapshot.cpu.total);
+                text.push(b"\r\n");
+                write_status_text(&text)?;
+                text = Record::new();
+                text.push(b"  memory: baseline=");
+                text.push_decimal(snapshot.memory_baseline);
+                text.push(b" free=");
+                text.push_decimal(snapshot.memory_free);
+                text.push(b" consumed-since-boot=");
+                text.push_decimal(snapshot.consumed_since_boot());
+                text.push(b"\r\n");
+                write_status_text(&text)?;
+                text = Record::new();
+                text.push(b"  context: committed=");
+                text.push_decimal(snapshot.committed_tokens as u64);
+                text.push(b" engine=");
+                text.push_decimal(snapshot.engine_position as u64);
+                text.push(b" limit=");
+                text.push_decimal(snapshot.context_limit as u64);
+                text.push(b" reserve=");
+                text.push_decimal(snapshot.generation_reserve as u64);
+                text.push(b"\r\n");
+                write_status_text(&text)?;
+
+                let mut record = Record::new();
+                record.push(b"PROMPTBOOT_EVENT v=1 event=RUNTIME_STATUS state=");
+                record.push(snapshot.state.label());
+                record.push(b" cpu_mode=");
+                record.push(snapshot.cpu.mode.label());
+                record.push(b" cpu_active=");
+                record.push_decimal(snapshot.cpu.active as u64);
+                record.push(b" cpu_workers=");
+                record.push_decimal(snapshot.cpu.workers as u64);
+                record.push(b" cpu_enabled=");
+                push_optional(&mut record, snapshot.cpu.enabled);
+                record.push(b" cpu_total=");
+                push_optional(&mut record, snapshot.cpu.total);
+                record.push(b" memory_baseline=");
+                record.push_decimal(snapshot.memory_baseline);
+                record.push(b" memory_free=");
+                record.push_decimal(snapshot.memory_free);
+                record.push(b" memory_consumed_since_boot=");
+                record.push_decimal(snapshot.consumed_since_boot());
+                record.push(b" committed_tokens=");
+                record.push_decimal(snapshot.committed_tokens as u64);
+                record.push(b" engine_position=");
+                record.push_decimal(snapshot.engine_position as u64);
+                record.push(b" context_limit=");
+                record.push_decimal(snapshot.context_limit as u64);
+                record.push(b" generation_reserve=");
+                record.push_decimal(snapshot.generation_reserve as u64);
+                record.push(b"\r\n");
+                if record.overflowed() {
+                    return Err(Failure::simple(b"STATUS_RECORD", b"status"));
+                }
+                emit_record_checked(record.as_bytes())
+                    .map_err(|status| Failure::efi(b"EVIDENCE_RECORD", b"record", status))
+            },
+        )
+        .map_err(|error| match error {
+            RuntimeMemoryFailure::Memory => Failure::simple(b"STATUS_MEMORY", b"status"),
+            RuntimeMemoryFailure::Emit(failure) => failure,
+        })?;
+        self.memory_free = memory_free;
+        self.render_status()
+            .map_err(|status| Failure::efi(b"STATUS_RENDER", b"status", status))
+    }
+
     unsafe fn emit_repl_ready(&mut self) -> Result<(), Failure> {
         let mut record = Record::new();
         record.push(b"PROMPTBOOT_EVENT v=1 event=MODEL_REPL_READY mode=model_repl model_sha256=");
@@ -415,6 +697,7 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
         self.working.fill(0);
         let had_history = self.committed_len != 0;
         let history = &self.committed[..self.committed_len];
+        let mut first_outcome = ConversationUsage::ZERO;
         let first = self.tokenizer.render_conversation_and_tokenize(
             history,
             line,
@@ -422,6 +705,7 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
             staging,
             self.working,
             tokenizer_scratch,
+            &mut first_outcome,
         );
         let overflow = |error: &ModelError| {
             error.status == promptboot_core::ModelStatus::OUTPUT_CAPACITY as u32
@@ -471,6 +755,7 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
             },
             HistoryDecision::RetryFresh => {
                 self.working.fill(0);
+                let mut fresh_outcome = ConversationUsage::ZERO;
                 let fresh = self.tokenizer.render_conversation_and_tokenize(
                     &[],
                     line,
@@ -478,6 +763,7 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
                     staging,
                     self.working,
                     tokenizer_scratch,
+                    &mut fresh_outcome,
                 );
                 let fresh_prompt_tokens = match &fresh {
                     Ok(usage) => usage.prompt_tokens as usize,
@@ -511,10 +797,16 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
                             }
                         };
                         self.emit_history_reset(prompt_index)?;
-                        self.reset_engine()?;
-                        self.committed.fill(0);
-                        self.committed_len = 0;
-                        self.history_turns = 0;
+                        reset_conversation_for_fresh_prompt(
+                            &mut self.engine,
+                            self.committed,
+                            self.working,
+                            prompt_tokens,
+                            &mut self.cached_len,
+                            &mut self.committed_len,
+                            &mut self.history_turns,
+                        )
+                        .map_err(|error| TurnError::inference(b"ENGINE_RESET", b"reset", error))?;
                         (usage, prompt_tokens, true)
                     }
                     HistoryDecision::Reject {
@@ -522,7 +814,7 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
                     } => {
                         let user_tokens = match &fresh {
                             Ok(usage) => usage.user_tokens,
-                            Err(error) => error.available.saturating_sub(29) as u32,
+                            Err(_) => fresh_outcome.user_tokens,
                         };
                         self.emit_context_rejected(
                             prompt_index,
@@ -543,7 +835,7 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
             } => {
                 let user_tokens = match &first {
                     Ok(usage) => usage.user_tokens,
-                    Err(error) => error.available.saturating_sub(29) as u32,
+                    Err(_) => first_outcome.user_tokens,
                 };
                 self.emit_context_rejected(
                     prompt_index,
@@ -558,8 +850,19 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
                 return Err(TurnError::utf(b"HISTORY_STATE"));
             }
         };
-        self.emit_prompt_tokenized(prompt_index, usage.user_tokens, prompt_count, reset)?;
-        self.generate(prompt_index, accepted_tsc, prompt_count)
+        self.emit_prompt_tokenized(
+            prompt_index,
+            usage.user_tokens,
+            prompt_count,
+            usage.prefix_tokens,
+            reset,
+        )?;
+        self.generate(
+            prompt_index,
+            accepted_tsc,
+            prompt_count,
+            usage.prefix_tokens as usize,
+        )
     }
 
     unsafe fn generate(
@@ -567,18 +870,26 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
         prompt_index: u64,
         accepted_tsc: u64,
         prompt_count: usize,
+        prefix_tokens: usize,
     ) -> Result<(), TurnError> {
         let logits = slice::from_raw_parts_mut(self.addresses[4] as *mut u32, LOGIT_WORDS);
-        let append_start = if self.cached_len == 0 {
-            0
-        } else if self.cached_len + 1 == self.committed_len
+        let conversation_append = self.cached_len != 0;
+        let append_start = if conversation_append
+            && self.cached_len + 1 == self.committed_len
             && self.cached_len < prompt_count
             && self.engine.position() as usize == self.cached_len
             && self.working[..self.cached_len] == self.committed[..self.cached_len]
         {
             self.cached_len
+        } else if !conversation_append
+            && self.engine.position() as usize == prefix_tokens
+            && prefix_tokens < prompt_count
+        {
+            prefix_tokens
+        } else if !conversation_append && self.engine.position() == 0 {
+            0
         } else {
-            self.reset_engine()?;
+            self.reset_engine_fresh()?;
             return Err(TurnError::utf(b"HISTORY_STATE"));
         };
         let generation_limit = core::cmp::min(GENERATION_RESERVE, CONTEXT_TOKENS - prompt_count);
@@ -630,15 +941,16 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
             establish_fp_state();
             let infer_start = timing_start(self.timing);
             let result = if generated == 0 {
-                if append_start == 0 {
-                    self.engine.prefill(
-                        &self.working[..prompt_count],
+                if conversation_append {
+                    self.engine.append_prefill(
+                        &self.working[append_start..prompt_count],
                         generation_limit as u32,
                         logits,
                     )
                 } else {
-                    self.engine.append_prefill(
-                        &self.working[append_start..prompt_count],
+                    self.engine.prefill_with_prefix(
+                        &self.working[..prompt_count],
+                        prefix_tokens as u32,
                         generation_limit as u32,
                         logits,
                     )
@@ -800,6 +1112,10 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
                 output_end,
             };
             generated += 1;
+            if let Err(error) = self.inference_step_complete(generated) {
+                turn_error = Some(error);
+                break;
+            }
             if piece_usage.kind == PieceKind::EOS as u32 {
                 if decoder.finish().is_err() {
                     turn_error = Some(
@@ -845,6 +1161,7 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
             if self.engine.position() as usize == expected {
                 self.cached_len = expected;
             } else {
+                let _ = self.reset_engine_fresh();
                 turn_error = Some(TurnError::utf(b"HISTORY_STATE"));
             }
         }
@@ -920,6 +1237,16 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
     }
 
     unsafe fn reset_engine(&mut self) -> Result<(), TurnError> {
+        establish_fp_state();
+        let result = self.engine.reset_to_prefix();
+        restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+        self.cached_len = 0;
+        result
+            .map(|_| ())
+            .map_err(|error| TurnError::inference(b"ENGINE_RESET", b"reset", error))
+    }
+
+    unsafe fn reset_engine_fresh(&mut self) -> Result<(), TurnError> {
         establish_fp_state();
         let result = self.engine.reset();
         restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
@@ -1015,6 +1342,7 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
         prompt_index: u64,
         user_tokens: u32,
         prompt_tokens: usize,
+        prefix_tokens: u32,
         reset: bool,
     ) -> Result<(), TurnError> {
         let mut record = Record::new();
@@ -1026,6 +1354,8 @@ impl ModelReplController<'_, '_, '_, '_, '_> {
         record.push_decimal(self.committed_len as u64);
         record.push(b" prompt_tokens=");
         record.push_decimal(prompt_tokens as u64);
+        record.push(b" prefix_tokens=");
+        record.push_decimal(prefix_tokens as u64);
         record.push(b" reserve=");
         record.push_decimal(GENERATION_RESERVE as u64);
         record.push(b" reset=");
@@ -1237,12 +1567,19 @@ impl Output for ModelReplController<'_, '_, '_, '_, '_> {
                     return;
                 }
                 let enabled = toggle_event_display();
-                let status = if enabled {
-                    write_ascii_checked(b"events: on\r\n")
+                let message = if enabled {
+                    b"events: on\r\n".as_slice()
                 } else {
-                    write_ascii_checked(b"events: off\r\n")
+                    b"events: off\r\n".as_slice()
                 };
-                if let Err(status) = status {
+                let boundary = if enabled {
+                    EVENT_DISPLAY_ON_FRAME
+                } else {
+                    EVENT_DISPLAY_OFF_FRAME
+                };
+                if let Err(status) = write_ascii_checked(message) {
+                    self.terminal = Some(Failure::efi(b"CONOUT_WRITE", b"output", status));
+                } else if let Err(status) = write_serial_checked(boundary) {
                     self.terminal = Some(Failure::efi(b"CONOUT_WRITE", b"output", status));
                 }
             }
@@ -1259,6 +1596,7 @@ impl Output for ModelReplController<'_, '_, '_, '_, '_> {
                     b"/events - toggle structured event display\r\n",
                     b"/help - show this help\r\n",
                     b"/new - clear the session and scrollback\r\n",
+                    b"/status - show runtime statistics\r\n",
                     b"Ctrl-C - stop generation\r\n",
                     b"Page Up/Page Down - scroll output\r\n",
                 ] {
@@ -1270,8 +1608,16 @@ impl Output for ModelReplController<'_, '_, '_, '_, '_> {
             }
             return;
         }
+        if is_status_command(line) {
+            unsafe {
+                if let Err(failure) = self.emit_runtime_status() {
+                    self.terminal = Some(failure);
+                }
+            }
+            return;
+        }
         if is_new_command(line) {
-            if let Err(error) = unsafe { self.reset_engine() } {
+            if let Err(error) = unsafe { self.reset_engine_fresh() } {
                 self.terminal = Some(match error.inference {
                     Some(inference) => Failure::inference(error.code, error.phase, inference),
                     None => Failure::simple(error.code, error.phase),
@@ -1290,11 +1636,32 @@ impl Output for ModelReplController<'_, '_, '_, '_, '_> {
                 }
                 if let Err(status) = write_ascii_checked(b"new session\r\n") {
                     self.terminal = Some(Failure::efi(b"CONOUT_WRITE", b"output", status));
+                    return;
+                }
+                if let Err(status) = self.set_state(RuntimeState::Waiting) {
+                    self.terminal = Some(Failure::efi(b"STATUS_RENDER", b"status", status));
                 }
             }
             return;
         }
-        match unsafe { self.accepted_turn(prompt_index, line) } {
+        if let Err(status) = unsafe { self.set_state(RuntimeState::Inferring) } {
+            self.terminal = Some(Failure::efi(b"STATUS_RENDER", b"status", status));
+            return;
+        }
+        let turn = unsafe { self.accepted_turn(prompt_index, line) };
+        let waiting = unsafe { self.set_state(RuntimeState::Waiting) };
+        if let Err(status) = waiting {
+            let completion = match &turn {
+                Ok(()) => TurnCompletion::Success,
+                Err(error) if error.recoverable => TurnCompletion::RecoverableFailure,
+                Err(_) => TurnCompletion::FatalFailure,
+            };
+            if waiting_render_failure_is_terminal(completion) {
+                self.terminal = Some(Failure::efi(b"STATUS_RENDER", b"status", status));
+                return;
+            }
+        }
+        match turn {
             Ok(()) => {}
             Err(error) if error.recoverable => unsafe {
                 self.working.fill(0);
@@ -1382,6 +1749,21 @@ fn push_hex(record: &mut Record, value: u64, width: usize) {
         at -= 1;
         record.push(&[digits[((value >> (at * 4)) & 15) as usize]]);
     }
+}
+
+fn push_optional(record: &mut Record, value: Option<u32>) {
+    match value {
+        Some(value) => record.push_decimal(value as u64),
+        None => record.push(b"unknown"),
+    }
+}
+
+unsafe fn write_status_text(text: &Record) -> Result<(), Failure> {
+    if text.overflowed() {
+        return Err(Failure::simple(b"STATUS_RECORD", b"status"));
+    }
+    write_ascii_checked(text.as_bytes())
+        .map_err(|status| Failure::efi(b"CONOUT_WRITE", b"output", status))
 }
 
 unsafe fn write_ascii_checked(bytes: &[u8]) -> Result<(), EfiStatus> {

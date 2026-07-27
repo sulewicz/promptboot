@@ -13,5 +13,5 @@ PROMPTBOOT_TEST_MODEL="${model}" cargo test \
     --manifest-path "${repo_root}/Cargo.toml" \
     -p promptboot-core --lib \
     --target x86_64-unknown-linux-gnu --release --locked \
-    -- --ignored
+    -- --ignored --test-threads=1
 printf '%s\n' "MODEL_HOST_VALIDATION_PASS"

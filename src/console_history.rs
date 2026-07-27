@@ -100,6 +100,28 @@ impl ConsoleHistory {
         end - start
     }
 
+    pub const fn width(&self) -> usize {
+        self.width
+    }
+
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn viewport_cursor(&self) -> (usize, usize) {
+        if self.view_offset != 0 {
+            let last = self.viewport_len().saturating_sub(1);
+            return (
+                self.viewport_line(last)
+                    .0
+                    .len()
+                    .min(self.width.saturating_sub(1)),
+                last,
+            );
+        }
+        (self.column, self.viewport_len().saturating_sub(1))
+    }
+
     pub fn viewport_line(&self, row: usize) -> (&[u16], bool) {
         let end = self.count.saturating_sub(self.view_offset);
         let start = end.saturating_sub(self.rows);
@@ -207,5 +229,34 @@ mod tests {
         while history.page_up() {}
         assert_eq!(history.viewport_line(0).0, [b'H' as u16]);
         assert_eq!(history.viewport_line(1).0, [b'I' as u16]);
+    }
+
+    #[test]
+    fn cursor_stays_inside_configured_content_rows() {
+        let mut history = Box::new(ConsoleHistory::new());
+        history.configure(4, 2);
+        history.write(&[b'a' as u16, b'b' as u16, b'c' as u16, b'd' as u16]);
+        assert_eq!(history.viewport_cursor(), (0, 1));
+        history.write(&[b'e' as u16, 0x000d, 0x000a, b'f' as u16]);
+        assert_eq!(history.viewport_cursor(), (1, 1));
+        assert_eq!(history.width(), 4);
+        assert_eq!(history.rows(), 2);
+    }
+
+    #[test]
+    fn paged_full_safe_width_line_preserves_every_cell_and_cursor() {
+        let mut history = Box::new(ConsoleHistory::new());
+        history.configure(4, 2);
+        history.write(
+            &"abcdefghijklmnopq"
+                .encode_utf16()
+                .collect::<std::vec::Vec<_>>(),
+        );
+
+        assert!(history.page_up());
+        assert_eq!(history.viewport_line(1).0, "ijkl".encode_utf16().collect::<std::vec::Vec<_>>());
+        assert_eq!(history.viewport_cursor(), (3, 1));
+        assert!(history.page_down());
+        assert_eq!(history.viewport_cursor(), (1, 1));
     }
 }

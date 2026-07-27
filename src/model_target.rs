@@ -522,6 +522,7 @@ pub(super) unsafe fn run(
     boot: *mut BootServices,
     mode: &str,
     build_id: &str,
+    conventional_memory_baseline: u64,
 ) -> EfiStatus {
     let timing = match calibrate(boot, mode) {
         Ok(value) => value,
@@ -531,7 +532,14 @@ pub(super) unsafe fn run(
         }
     };
     let mut session = Session::new(boot, image);
-    let outcome = execute(&mut session, system_table, mode, build_id, timing);
+    let outcome = execute(
+        &mut session,
+        system_table,
+        mode,
+        build_id,
+        timing,
+        conventional_memory_baseline,
+    );
     let record_failure = matches!(&outcome, Err(failure) if failure.code == b"MODEL_RECORD");
     let (attempted, ok, cleanup_error) = session.cleanup();
     let primary_selection = primary_survives_cleanup(
@@ -596,6 +604,7 @@ unsafe fn execute(
     mode: &str,
     build_id: &str,
     calibration: Timing,
+    conventional_memory_baseline: u64,
 ) -> Result<(), Failure> {
     let mut interface: *mut c_void = null_mut();
     restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
@@ -818,6 +827,7 @@ unsafe fn execute(
             &tokenizer,
             session.addresses,
             calibration,
+            conventional_memory_baseline,
         );
         drop(tokenizer);
         drop(model);
@@ -845,7 +855,7 @@ unsafe fn execute(
         let prompt_tokens = slice::from_raw_parts(session.addresses[5] as *const u32, PROMPT.len());
         establish_fp_state();
         let init_start = timing_start(calibration);
-        let mut engine = match InferenceEngine::build(&model, kv, scratch) {
+        let mut engine = match InferenceEngine::build(&model, kv, scratch, None) {
             Ok(value) => value,
             Err(error) => {
                 restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));

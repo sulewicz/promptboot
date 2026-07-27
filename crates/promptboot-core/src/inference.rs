@@ -1,9 +1,14 @@
+use core::cell::UnsafeCell;
+use core::ffi::c_void;
+use core::marker::{PhantomData, PhantomPinned};
 use core::mem::{align_of, size_of};
 use core::ptr;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::arena::ArenaUsage;
 use crate::fp32_sse2;
 use crate::model::{ModelView, TensorView, MODEL_BYTES, VOCAB_COUNT};
+use crate::tokenizer::MAX_TOKENS;
 
 pub const CONTEXT_LIMIT: u32 = 32_768;
 pub const KV_BYTES: usize = 805_306_368;
@@ -17,13 +22,20 @@ pub const SAMPLING_TOP_P_MILLI: u32 = 800;
 pub const SAMPLING_REPETITION_PENALTY_MILLI: u32 = 1_100;
 pub const SAMPLING_POLICY: &[u8] = b"temperature_0p7_top_k_20_top_p_0p8_repetition_penalty_1p1";
 
+pub fn inference_avx2_available() -> bool {
+    fp32_sse2::inference_avx2_available()
+}
+
 const HIDDEN_WORDS: usize = 896;
 const KV_HEADS: usize = 2;
 const QUERY_HEADS: usize = 14;
 const HEAD_WORDS: usize = 64;
 const FFN_WORDS: usize = 4_864;
-const LAYERS: usize = 24;
+pub(crate) const LAYERS: usize = 24;
 const KV_WORDS_PER_POSITION: usize = LAYERS * 2 * KV_HEADS * HEAD_WORDS;
+pub(crate) const KV_TILE: usize = 4;
+pub(crate) const KV_VALUE_WORDS: usize = KV_HEADS * CONTEXT_LIMIT as usize * HEAD_WORDS;
+pub(crate) const KV_LAYER_WORDS: usize = 2 * KV_VALUE_WORDS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -287,8 +299,408 @@ pub struct InferenceEngine<'model, 'bytes, 'kv, 'scratch> {
     predictions_emitted: u32,
     last_selected: u32,
     state: InferenceState,
+    backend: fp32_sse2::InferenceBackend,
+    dispatcher: Option<InferenceDispatcher<'model>>,
     kv_high_water: u64,
     scratch_high_water: u64,
+    retained_prefix: RetainedPrefix,
+    #[cfg(test)]
+    q8_preparations: u32,
+}
+
+pub struct InferenceDispatcher<'context> {
+    context: *mut c_void,
+    dispatch: unsafe extern "efiapi" fn(*mut c_void, *mut InferenceWorkerJob),
+    _context: PhantomData<&'context mut c_void>,
+}
+
+impl<'context> InferenceDispatcher<'context> {
+    /// The callback must not return unless every worker has returned and the
+    /// job protocol is valid. Firmware dispatch failures are fatal and must
+    /// not return to core because the job memory can no longer be inspected.
+    pub unsafe fn new<T>(
+        context: &'context mut T,
+        dispatch: unsafe extern "efiapi" fn(*mut c_void, *mut InferenceWorkerJob),
+    ) -> Self {
+        Self {
+            context: (context as *mut T).cast(),
+            dispatch,
+            _context: PhantomData,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MatvecJob {
+    weights: *const u8,
+    output: *mut u8,
+    prepared: *mut u8,
+    rows: usize,
+    columns: usize,
+    q8: bool,
+}
+
+impl MatvecJob {
+    const EMPTY: Self = Self {
+        weights: ptr::null(),
+        output: ptr::null_mut(),
+        prepared: ptr::null_mut(),
+        rows: 0,
+        columns: 0,
+        q8: false,
+    };
+}
+
+struct CompletionBarrier {
+    arrivals: AtomicUsize,
+    generation: AtomicUsize,
+}
+
+impl CompletionBarrier {
+    const fn new() -> Self {
+        Self {
+            arrivals: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
+        }
+    }
+
+    fn wait(&self, workers: usize) {
+        let generation = self.generation.load(Ordering::Acquire);
+        if self.arrivals.fetch_add(1, Ordering::AcqRel) + 1 == workers {
+            self.arrivals.store(0, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::Release);
+        } else {
+            while self.generation.load(Ordering::Acquire) == generation {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Opaque, pinned per-token state passed through the firmware adapter.
+pub struct InferenceWorkerJob {
+    engine: *mut c_void,
+    coordinate: unsafe fn(*mut c_void, *mut InferenceWorkerJob),
+    logits: *mut u32,
+    logits_len: usize,
+    token: u32,
+    produce_logits: bool,
+    workers: AtomicUsize,
+    backend: AtomicU32,
+    rejection: AtomicU32,
+    job_epoch: AtomicUsize,
+    terminal: AtomicU32,
+    row_hits: AtomicUsize,
+    result: UnsafeCell<InferenceError>,
+    descriptor: UnsafeCell<MatvecJob>,
+    completion: CompletionBarrier,
+    expected_jobs: usize,
+    _pinned: PhantomPinned,
+}
+
+unsafe impl Sync for InferenceWorkerJob {}
+
+impl InferenceWorkerJob {
+    fn new(
+        engine: *mut c_void,
+        coordinate: unsafe fn(*mut c_void, *mut InferenceWorkerJob),
+        token: u32,
+        logits: &mut [u32],
+        produce_logits: bool,
+    ) -> Self {
+        Self {
+            engine,
+            coordinate,
+            logits: logits.as_mut_ptr(),
+            logits_len: logits.len(),
+            token,
+            produce_logits,
+            workers: AtomicUsize::new(0),
+            backend: AtomicU32::new(u32::MAX),
+            rejection: AtomicU32::new(0),
+            job_epoch: AtomicUsize::new(0),
+            terminal: AtomicU32::new(0),
+            row_hits: AtomicUsize::new(0),
+            result: UnsafeCell::new(InferenceError::new(
+                InferenceStatus::STATE,
+                InferenceDomain::PROMPT,
+                NO_LAYER,
+                0,
+                NO_TENSOR,
+                0,
+                0,
+                InferenceFieldKind::STATE,
+                5,
+            )),
+            descriptor: UnsafeCell::new(MatvecJob::EMPTY),
+            completion: CompletionBarrier::new(),
+            expected_jobs: if produce_logits { 169 } else { 168 },
+            _pinned: PhantomPinned,
+        }
+    }
+
+    /// Returns zero only for a complete, internally consistent token dispatch.
+    pub fn protocol_status(&self) -> u32 {
+        let rejection = self.rejection.load(Ordering::Acquire);
+        if rejection != 0 {
+            return rejection;
+        }
+        let terminal = self.terminal.load(Ordering::Acquire);
+        if terminal == 0 {
+            return 10;
+        }
+        let job_epoch = self.job_epoch.load(Ordering::Acquire);
+        if (terminal == 1 && job_epoch != self.expected_jobs)
+            || (terminal == 2 && job_epoch > self.expected_jobs)
+        {
+            return 11;
+        }
+        if self.completion.arrivals.load(Ordering::Acquire) != 0
+            || self.completion.generation.load(Ordering::Acquire) != job_epoch
+        {
+            return 12;
+        }
+        0
+    }
+
+    fn publish(&self, descriptor: MatvecJob, backend: fp32_sse2::InferenceBackend) {
+        let epoch = self.job_epoch.load(Ordering::Relaxed) + 1;
+        unsafe { ptr::write(self.descriptor.get(), descriptor) };
+        self.row_hits.store(0, Ordering::Relaxed);
+        self.job_epoch.store(epoch, Ordering::Release);
+        let end = descriptor.rows / self.worker_count();
+        unsafe { run_matvec_rows(descriptor, backend, 0, end) };
+        self.row_hits.fetch_add(end, Ordering::AcqRel);
+        self.completion.wait(self.worker_count());
+        if self.row_hits.load(Ordering::Acquire) != descriptor.rows {
+            self.rejection.store(4, Ordering::Release);
+        }
+    }
+
+    fn worker_count(&self) -> usize {
+        self.workers.load(Ordering::Acquire)
+    }
+
+    unsafe fn run(&self, slot: usize, workers: usize, backend: u32) -> u32 {
+        if workers < 2 || slot >= workers || backend > 1 {
+            self.rejection.store(1, Ordering::Release);
+            return 1;
+        }
+        let stored_workers = self.workers.compare_exchange(
+            0,
+            workers,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if !match stored_workers {
+            Ok(_) => true,
+            Err(value) => value == workers,
+        } {
+            self.rejection.store(2, Ordering::Release);
+            return 2;
+        }
+        let stored_backend = self.backend.compare_exchange(
+            u32::MAX,
+            backend,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if !match stored_backend {
+            Ok(_) => true,
+            Err(value) => value == backend,
+        } {
+            self.rejection.store(3, Ordering::Release);
+            return 3;
+        }
+        if slot == 0 {
+            (self.coordinate)(self.engine, (self as *const Self).cast_mut());
+            return self.protocol_status();
+        }
+
+        let selected = if backend == 0 {
+            fp32_sse2::InferenceBackend::Sse2
+        } else {
+            fp32_sse2::InferenceBackend::Avx2
+        };
+        let mut observed = 0;
+        loop {
+            let epoch = self.job_epoch.load(Ordering::Acquire);
+            if epoch != observed {
+                let descriptor = ptr::read(self.descriptor.get());
+                let first = descriptor.rows * slot / workers;
+                let end = descriptor.rows * (slot + 1) / workers;
+                run_matvec_rows(descriptor, selected, first, end);
+                self.row_hits.fetch_add(end - first, Ordering::AcqRel);
+                self.completion.wait(workers);
+                observed = epoch;
+                continue;
+            }
+            if self.terminal.load(Ordering::Acquire) != 0 {
+                return self.protocol_status();
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Runs one validated AP slot. The boot adapter owns slot assignment, common
+/// backend selection, and processor-state establishment/restoration.
+pub unsafe extern "efiapi" fn inference_worker_entry(
+    job: *mut InferenceWorkerJob,
+    slot: u32,
+    workers: u32,
+    backend: u32,
+) -> u32 {
+    if job.is_null() {
+        return 1;
+    }
+    (*job).run(slot as usize, workers as usize, backend)
+}
+
+struct TokenCoordinator {
+    backend: fp32_sse2::InferenceBackend,
+    parallel: *const InferenceWorkerJob,
+}
+
+impl TokenCoordinator {
+    const fn serial(backend: fp32_sse2::InferenceBackend) -> Self {
+        Self {
+            backend,
+            parallel: ptr::null(),
+        }
+    }
+
+    unsafe fn parallel(job: *const InferenceWorkerJob) -> Self {
+        let backend = if (*job).backend.load(Ordering::Acquire) == 0 {
+            fp32_sse2::InferenceBackend::Sse2
+        } else {
+            fp32_sse2::InferenceBackend::Avx2
+        };
+        Self {
+            backend,
+            parallel: job,
+        }
+    }
+
+    unsafe fn q4(
+        &self,
+        weights: *const u8,
+        output: *mut u8,
+        prepared: *mut u8,
+        rows: usize,
+        columns: usize,
+    ) {
+        self.run(MatvecJob {
+            weights,
+            output,
+            prepared,
+            rows,
+            columns,
+            q8: false,
+        });
+    }
+
+    unsafe fn q8(
+        &self,
+        weights: *const u8,
+        output: *mut u32,
+        prepared: *mut u8,
+        rows: usize,
+        columns: usize,
+    ) {
+        self.run(MatvecJob {
+            weights,
+            output: output.cast(),
+            prepared,
+            rows,
+            columns,
+            q8: true,
+        });
+    }
+
+    unsafe fn run(&self, descriptor: MatvecJob) {
+        if self.parallel.is_null() {
+            run_matvec_rows(descriptor, self.backend, 0, descriptor.rows);
+        } else {
+            (*self.parallel).publish(descriptor, self.backend);
+        }
+    }
+}
+
+unsafe fn run_matvec_rows(
+    descriptor: MatvecJob,
+    backend: fp32_sse2::InferenceBackend,
+    first: usize,
+    end: usize,
+) {
+    if descriptor.q8 {
+        fp32_sse2::inference_q8_matvec_rows_prepared(
+            backend,
+            descriptor.weights,
+            descriptor.output.cast(),
+            descriptor.prepared,
+            descriptor.rows,
+            descriptor.columns,
+            first,
+            end,
+        );
+    } else {
+        fp32_sse2::inference_q4_matvec_rows_prepared(
+            backend,
+            descriptor.weights,
+            descriptor.output,
+            descriptor.prepared,
+            descriptor.rows,
+            descriptor.columns,
+            first,
+            end,
+        );
+    }
+}
+
+unsafe fn coordinate_engine<'model, 'bytes, 'kv, 'scratch>(
+    engine: *mut c_void,
+    job: *mut InferenceWorkerJob,
+)
+where
+    'bytes: 'model,
+{
+    let engine = &mut *engine.cast::<InferenceEngine<'model, 'bytes, 'kv, 'scratch>>();
+    let job_ref = &*job;
+    let logits = core::slice::from_raw_parts_mut(job_ref.logits, job_ref.logits_len);
+    let coordinator = TokenCoordinator::parallel(job);
+    let previous_mxcsr = fp32_sse2::inference_enter_fp();
+    let result = engine.evaluate_inner(
+        job_ref.token,
+        logits,
+        job_ref.produce_logits,
+        &coordinator,
+    );
+    fp32_sse2::inference_exit_fp(previous_mxcsr);
+    match result {
+        Ok(()) => job_ref.terminal.store(1, Ordering::Release),
+        Err(error) => {
+            ptr::write(job_ref.result.get(), error);
+            job_ref.terminal.store(2, Ordering::Release);
+        }
+    }
+}
+
+struct RetainedPrefix {
+    len: u32,
+    tokens: [u32; MAX_TOKENS],
+}
+
+impl RetainedPrefix {
+    const EMPTY: Self = Self {
+        len: 0,
+        tokens: [0; MAX_TOKENS],
+    };
+
+    fn clear(&mut self) {
+        self.tokens.fill(0);
+        self.len = 0;
+    }
 }
 
 fn buffer_error(storage: &[u8], needed: usize, sub: u32) -> Option<InferenceError> {
@@ -559,13 +971,14 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
     /// use promptboot_core::{InferenceEngine, ModelView};
     ///
     /// fn alias_is_rejected(model: &ModelView<'_>, storage: &mut [u8]) {
-    ///     let _engine = InferenceEngine::build(model, storage, storage);
+    ///     let _engine = InferenceEngine::build(model, storage, storage, None);
     /// }
     /// ```
     pub fn build(
         model: &'model ModelView<'bytes>,
         kv_storage: &'kv mut [u8],
         scratch_storage: &'scratch mut [u8],
+        dispatcher: Option<InferenceDispatcher<'model>>,
     ) -> Result<Self, InferenceError> {
         if let Some(error) = buffer_error(kv_storage, KV_BYTES, 0) {
             return Err(error);
@@ -577,7 +990,6 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
         if let Some(error) = take_build_fault_for_test() {
             return Err(error);
         }
-        kv_storage[..KV_BYTES].fill(0);
         scratch_storage[..SCRATCH_BYTES].fill(0);
         Ok(Self {
             model,
@@ -588,9 +1000,27 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
             predictions_emitted: 0,
             last_selected: 0,
             state: InferenceState::RESET,
+            backend: fp32_sse2::InferenceBackend::detect(),
+            dispatcher,
             kv_high_water: 0,
             scratch_high_water: 0,
+            retained_prefix: RetainedPrefix::EMPTY,
+            #[cfg(test)]
+            q8_preparations: 0,
         })
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.name()
+    }
+
+    #[inline]
+    unsafe fn prepare_q8(&mut self, input: *const u8, staging: *mut u8, columns: usize) {
+        #[cfg(test)]
+        {
+            self.q8_preparations += 1;
+        }
+        fp32_sse2::inference_prepare_q8(input, staging, columns);
     }
 
     pub fn prefill(
@@ -606,6 +1036,60 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
             return Err(self.state_error(InferenceState::RESET, 1));
         }
         self.prefill_inner(prompt_tokens, generation_reserve, logits, false)
+    }
+
+    /// Evaluates a fresh prompt while retaining only its fixed leading KV
+    /// state. After `reset_to_prefix`, the same token prefix is verified before
+    /// the remaining prompt is appended.
+    pub fn prefill_with_prefix(
+        &mut self,
+        prompt_tokens: &[u32],
+        prefix_tokens: u32,
+        generation_reserve: u32,
+        logits: &mut [u32],
+    ) -> Result<InferenceStep, InferenceError> {
+        let prefix = prefix_tokens as usize;
+        if prefix == 0 || prefix >= prompt_tokens.len() || prefix > MAX_TOKENS {
+            self.reset_state();
+            return Err(InferenceError::new(
+                InferenceStatus::CONTEXT,
+                InferenceDomain::PROMPT,
+                NO_LAYER,
+                0,
+                NO_TENSOR,
+                1,
+                prefix_tokens as u64,
+                InferenceFieldKind::CONTEXT,
+                3,
+            ));
+        }
+        if self.retained_prefix.len != 0 {
+            if self.state == InferenceState::RESET
+                && self.position == self.retained_prefix.len
+                && self.retained_prefix.len == prefix_tokens
+                && self.retained_prefix.tokens[..prefix] == prompt_tokens[..prefix]
+            {
+                return self.prefill_inner(
+                    &prompt_tokens[prefix..],
+                    generation_reserve,
+                    logits,
+                    true,
+                );
+            }
+            if self.state != InferenceState::RESET {
+                let error = self.state_error(InferenceState::RESET, 4);
+                self.reset_state();
+                return Err(error);
+            }
+            self.reset_state();
+        }
+        let result = self.prefill(prompt_tokens, generation_reserve, logits);
+        if result.is_ok() {
+            self.retained_prefix.clear();
+            self.retained_prefix.tokens[..prefix].copy_from_slice(&prompt_tokens[..prefix]);
+            self.retained_prefix.len = prefix_tokens;
+        }
+        result
     }
 
     pub fn append_prefill(
@@ -810,15 +1294,44 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
         self.publish_step(logits)
     }
 
-    pub fn reset(&mut self) -> Result<(), InferenceError> {
-        self.kv[..KV_BYTES].fill(0);
+    fn reset_state(&mut self) {
         self.scratch[..SCRATCH_BYTES].fill(0);
         self.position = 0;
         self.generation_reserve = 0;
         self.predictions_emitted = 0;
         self.last_selected = 0;
         self.state = InferenceState::RESET;
+        self.retained_prefix.clear();
+    }
+
+    pub fn reset(&mut self) -> Result<(), InferenceError> {
+        self.reset_state();
         Ok(())
+    }
+
+    /// Resets generation and conversation state while keeping one previously
+    /// validated fixed prefix in place. Invalid or faulted state falls back to
+    /// a full logical reset.
+    pub fn reset_to_prefix(&mut self) -> Result<u32, InferenceError> {
+        self.scratch[..SCRATCH_BYTES].fill(0);
+        let prefix = self.retained_prefix.len;
+        let valid = match self.state {
+            InferenceState::RESET => prefix != 0 && self.position == prefix,
+            InferenceState::READY | InferenceState::EOS => {
+                prefix != 0 && self.position >= prefix && self.position <= CONTEXT_LIMIT
+            }
+            InferenceState::FAULTED => false,
+        };
+        if !valid {
+            self.reset_state();
+            return Ok(0);
+        }
+        self.position = prefix;
+        self.generation_reserve = 0;
+        self.predictions_emitted = 0;
+        self.last_selected = 0;
+        self.state = InferenceState::RESET;
+        Ok(prefix)
     }
 
     pub fn usage(&self) -> InferenceUsage {
@@ -903,8 +1416,37 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
         logits: &mut [u32],
         produce_logits: bool,
     ) -> Result<(), InferenceError> {
+        if let Some(dispatcher) = self.dispatcher.as_ref() {
+            let context = dispatcher.context;
+            let dispatch = dispatcher.dispatch;
+            let mut job = core::pin::pin!(InferenceWorkerJob::new(
+                (self as *mut Self).cast(),
+                coordinate_engine,
+                token,
+                logits,
+                produce_logits,
+            ));
+            unsafe { dispatch(context, job.as_mut().get_unchecked_mut()) };
+            let job = job.as_ref().get_ref();
+            return match job.terminal.load(Ordering::Acquire) {
+                1 => Ok(()),
+                2 => Err(unsafe { ptr::read(job.result.get()) }),
+                _ => Err(InferenceError::new(
+                    InferenceStatus::STATE,
+                    InferenceDomain::PROMPT,
+                    NO_LAYER,
+                    self.position,
+                    NO_TENSOR,
+                    1,
+                    0,
+                    InferenceFieldKind::STATE,
+                    6,
+                )),
+            };
+        }
         let previous_mxcsr = unsafe { fp32_sse2::inference_enter_fp() };
-        let result = self.evaluate_inner(token, logits, produce_logits);
+        let coordinator = TokenCoordinator::serial(self.backend);
+        let result = self.evaluate_inner(token, logits, produce_logits, &coordinator);
         unsafe { fp32_sse2::inference_exit_fp(previous_mxcsr) };
         result
     }
@@ -914,6 +1456,7 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
         token: u32,
         logits: &mut [u32],
         produce_logits: bool,
+        coordinator: &TokenCoordinator,
     ) -> Result<(), InferenceError> {
         let position = self.position;
         let base = self.scratch.as_mut_ptr();
@@ -979,9 +1522,9 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
             let q_weight = self.layer_tensor(layer, 19, InferenceDomain::Q)?;
             self.scratch_high_water = self.scratch_high_water.max(USED_SCRATCH as u64);
             unsafe {
-                fp32_sse2::inference_q4_matvec(
+                self.prepare_q8(norm, q8_staging, HIDDEN_WORDS);
+                coordinator.q4(
                     q_weight.data().as_ptr(),
-                    norm,
                     q,
                     q8_staging,
                     HIDDEN_WORDS,
@@ -1000,9 +1543,8 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
 
             let k_weight = self.layer_tensor(layer, 16, InferenceDomain::K)?;
             unsafe {
-                fp32_sse2::inference_q4_matvec(
+                coordinator.q4(
                     k_weight.data().as_ptr(),
-                    norm,
                     k,
                     q8_staging,
                     128,
@@ -1015,9 +1557,8 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
 
             let v_weight = self.layer_tensor(layer, 21, InferenceDomain::V)?;
             unsafe {
-                fp32_sse2::inference_q4_matvec(
+                coordinator.q4(
                     v_weight.data().as_ptr(),
-                    norm,
                     v,
                     q8_staging,
                     128,
@@ -1042,9 +1583,10 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
             self.check(InferenceDomain::ROPE, layer_u32, k_weight.meta().id, k, 128)?;
 
             self.check(InferenceDomain::KV, layer_u32, k_weight.meta().id, k, 128)?;
-            unsafe { self.write_kv(layer, position as usize, k, v) };
+            unsafe { self.write_kv(layer, position as usize, k, v)? };
             unsafe {
                 fp32_sse2::inference_attention(
+                    self.backend,
                     q,
                     self.kv.as_ptr(),
                     attention,
@@ -1064,9 +1606,9 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
 
             let attn_output = self.layer_tensor(layer, 17, InferenceDomain::ATTN_OUTPUT)?;
             unsafe {
-                fp32_sse2::inference_q4_matvec(
+                self.prepare_q8(attention, q8_staging, HIDDEN_WORDS);
+                coordinator.q4(
                     attn_output.data().as_ptr(),
-                    attention,
                     norm,
                     q8_staging,
                     HIDDEN_WORDS,
@@ -1097,9 +1639,9 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
 
             let gate_weight = self.layer_tensor(layer, 12, InferenceDomain::GATE)?;
             unsafe {
-                fp32_sse2::inference_q4_matvec(
+                self.prepare_q8(norm, q8_staging, HIDDEN_WORDS);
+                coordinator.q4(
                     gate_weight.data().as_ptr(),
-                    norm,
                     gate,
                     q8_staging,
                     FFN_WORDS,
@@ -1115,9 +1657,8 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
             )?;
             let up_weight = self.layer_tensor(layer, 13, InferenceDomain::UP)?;
             unsafe {
-                fp32_sse2::inference_q4_matvec(
+                coordinator.q4(
                     up_weight.data().as_ptr(),
-                    norm,
                     up,
                     q8_staging,
                     FFN_WORDS,
@@ -1142,9 +1683,9 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
 
             let down_weight = self.layer_tensor(layer, 11, InferenceDomain::DOWN)?;
             unsafe {
-                fp32_sse2::inference_q4_matvec(
+                self.prepare_q8(product, q8_staging, FFN_WORDS);
+                coordinator.q4(
                     down_weight.data().as_ptr(),
-                    product,
                     norm,
                     q8_staging,
                     HIDDEN_WORDS,
@@ -1197,9 +1738,9 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
             )?;
             let output = self.tensor(290, InferenceDomain::LOGITS, NO_LAYER)?;
             unsafe {
-                fp32_sse2::inference_q8_matvec(
+                self.prepare_q8(norm, q8_staging, HIDDEN_WORDS);
+                coordinator.q8(
                     output.data().as_ptr(),
-                    norm,
                     logits.as_mut_ptr(),
                     q8_staging,
                     LOGIT_WORDS,
@@ -1265,16 +1806,84 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
         })
     }
 
-    unsafe fn write_kv(&mut self, layer: usize, position: usize, k: *const u8, v: *const u8) {
+    unsafe fn write_kv(
+        &mut self,
+        layer: usize,
+        position: usize,
+        k: *const u8,
+        v: *const u8,
+    ) -> Result<(), InferenceError> {
+        if layer >= LAYERS || position >= CONTEXT_LIMIT as usize {
+            return Err(InferenceError::new(
+                InferenceStatus::ARITHMETIC,
+                InferenceDomain::KV,
+                layer as u32,
+                position as u32,
+                NO_TENSOR,
+                layer as u64,
+                KV_BYTES as u64 / 4,
+                InferenceFieldKind::USIZE,
+                0,
+            ));
+        }
+        let final_key = kv_word(layer, 0, position, KV_HEADS - 1, HEAD_WORDS - 1);
+        let final_value = kv_word(layer, 1, position, KV_HEADS - 1, HEAD_WORDS - 1);
+        if final_key >= KV_BYTES / 4 || final_value >= KV_BYTES / 4 {
+            return Err(InferenceError::new(
+                InferenceStatus::CAPACITY,
+                InferenceDomain::KV,
+                layer as u32,
+                position as u32,
+                NO_TENSOR,
+                (final_key.max(final_value) + 1) as u64,
+                (KV_BYTES / 4) as u64,
+                InferenceFieldKind::BYTES,
+                0,
+            ));
+        }
         for head in 0..KV_HEADS {
             for component in 0..HEAD_WORDS {
                 let source = (head * HEAD_WORDS + component) * 4;
                 let k_word = kv_word(layer, 0, position, head, component);
-                let v_word = kv_word(layer, 1, position, head, component);
                 ptr::copy_nonoverlapping(k.add(source), self.kv.as_mut_ptr().add(k_word * 4), 4);
+            }
+        }
+        #[cfg(test)]
+        if take_kv_write_fault_for_test(0) {
+            return Err(InferenceError::new(
+                InferenceStatus::ARITHMETIC,
+                InferenceDomain::KV,
+                layer as u32,
+                position as u32,
+                NO_TENSOR,
+                0,
+                0,
+                InferenceFieldKind::FAULT,
+                0,
+            ));
+        }
+        for head in 0..KV_HEADS {
+            for component in 0..HEAD_WORDS {
+                let source = (head * HEAD_WORDS + component) * 4;
+                let v_word = kv_word(layer, 1, position, head, component);
                 ptr::copy_nonoverlapping(v.add(source), self.kv.as_mut_ptr().add(v_word * 4), 4);
             }
         }
+        #[cfg(test)]
+        if take_kv_write_fault_for_test(1) {
+            return Err(InferenceError::new(
+                InferenceStatus::ARITHMETIC,
+                InferenceDomain::KV,
+                layer as u32,
+                position as u32,
+                NO_TENSOR,
+                0,
+                0,
+                InferenceFieldKind::FAULT,
+                1,
+            ));
+        }
+        Ok(())
     }
 
     fn check(
@@ -1330,6 +1939,7 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
         self.scratch[..SCRATCH_BYTES].fill(0);
         logits.fill(0);
         self.state = InferenceState::FAULTED;
+        self.retained_prefix.clear();
         error
     }
 
@@ -1355,8 +1965,57 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
     }
 
     #[cfg(test)]
-    pub(crate) fn kv_is_zero_for_test(&self) -> bool {
-        self.kv[..KV_BYTES].iter().all(|byte| *byte == 0)
+    pub(crate) fn retained_prefix_for_test(&self) -> Option<u32> {
+        (self.retained_prefix.len != 0).then_some(self.retained_prefix.len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_backend_for_test(&mut self, backend: fp32_sse2::InferenceBackend) {
+        self.backend = backend;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kv_is_filled_for_test(&self, value: u8) -> bool {
+        self.kv[..KV_BYTES].iter().all(|byte| *byte == value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kv_byte_for_test(&self, at: usize) -> u8 {
+        self.kv[at]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn logical_kv_word_for_test(
+        &self,
+        layer: usize,
+        kind: usize,
+        position: usize,
+        head: usize,
+        component: usize,
+    ) -> u32 {
+        let word = kv_word(layer, kind, position, head, component);
+        unsafe { ptr::read_unaligned(self.kv.as_ptr().cast::<u32>().add(word)) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_kv_for_test(
+        &mut self,
+        layer: usize,
+        position: usize,
+        k: &[u32; 128],
+        v: &[u32; 128],
+    ) -> Result<(), InferenceError> {
+        unsafe { self.write_kv(layer, position, k.as_ptr().cast(), v.as_ptr().cast()) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_q8_preparations_for_test(&mut self) {
+        self.q8_preparations = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn q8_preparations_for_test(&self) -> u32 {
+        self.q8_preparations
     }
 
     #[cfg(test)]
@@ -1373,18 +2032,27 @@ impl<'model, 'bytes, 'kv, 'scratch> InferenceEngine<'model, 'bytes, 'kv, 'scratc
     }
 }
 
-const fn kv_word(
+pub(crate) const fn kv_word(
     layer: usize,
     kind: usize,
     position: usize,
     head: usize,
     component: usize,
 ) -> usize {
-    ((((layer * 2 + kind) * CONTEXT_LIMIT as usize + position) * 2 + head) * 64) + component
+    let base = layer * KV_LAYER_WORDS;
+    if kind == 0 {
+        base + (((head * (CONTEXT_LIMIT as usize / KV_TILE) + position / KV_TILE) * HEAD_WORDS
+            + component)
+            * KV_TILE
+            + position % KV_TILE)
+    } else {
+        base + KV_VALUE_WORDS
+            + ((head * CONTEXT_LIMIT as usize + position) * HEAD_WORDS + component)
+    }
 }
 
 #[cfg(test)]
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64};
 
 #[cfg(test)]
 static FAULT_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -1424,6 +2092,8 @@ static ARITHMETIC_FAULT_NEEDED: AtomicU64 = AtomicU64::new(0);
 static ARITHMETIC_FAULT_AVAILABLE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static ARITHMETIC_FAULT_SUB: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+static KV_WRITE_FAULT_STAGE: AtomicU32 = AtomicU32::new(u32::MAX);
 
 #[cfg(test)]
 pub(crate) fn set_inference_fault_for_test(
@@ -1477,6 +2147,18 @@ pub(crate) fn set_inference_arithmetic_fault_for_test(
     ARITHMETIC_FAULT_AVAILABLE.store(available, Ordering::Relaxed);
     ARITHMETIC_FAULT_SUB.store(sub, Ordering::Relaxed);
     ARITHMETIC_FAULT_ACTIVE.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn set_kv_write_fault_for_test(stage: u32) {
+    KV_WRITE_FAULT_STAGE.store(stage, Ordering::Release);
+}
+
+#[cfg(test)]
+fn take_kv_write_fault_for_test(stage: u32) -> bool {
+    KV_WRITE_FAULT_STAGE
+        .compare_exchange(stage, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 #[cfg(test)]

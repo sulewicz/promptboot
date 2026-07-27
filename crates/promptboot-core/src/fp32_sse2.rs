@@ -5,10 +5,122 @@
 //! private helpers carry binary32 as `u32` and execute scalar SSE2 through
 //! explicit inline assembly. No float is visible at a function or crate ABI.
 
+use core::arch::x86_64::{
+    __cpuid, __cpuid_count, _mm_add_pd, _mm_castsi128_ps, _mm_cvtpd_ps, _mm_cvtps_pd, _mm_loadu_ps,
+    _mm_movehl_ps, _mm_mul_ps, _mm_set1_epi32, _mm_setzero_pd, _mm_storeu_ps,
+};
 use core::arch::{asm, global_asm};
 use core::ptr;
 
 use crate::PrimitiveStatus;
+
+const AVX_STATE_MASK: u64 = 0x6;
+const AVX_LEAF1_MASK: u32 = (1 << 26) | (1 << 27) | (1 << 28);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InferenceBackend {
+    Sse2,
+    Avx2,
+}
+
+impl InferenceBackend {
+    pub(crate) fn detect() -> Self {
+        if inference_avx2_available() {
+            Self::Avx2
+        } else {
+            Self::Sse2
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Sse2 => "sse2",
+            Self::Avx2 => "avx2",
+        }
+    }
+}
+
+pub(crate) fn inference_avx2_available() -> bool {
+    let max_basic_leaf = __cpuid(0).eax;
+    let leaf1_ecx = if max_basic_leaf >= 1 {
+        __cpuid(1).ecx
+    } else {
+        0
+    };
+    resolve_avx2(
+        max_basic_leaf,
+        leaf1_ecx,
+        || unsafe { xgetbv0() },
+        || __cpuid_count(7, 0).ebx,
+    )
+}
+
+fn resolve_avx2<X, L>(max_basic_leaf: u32, leaf1_ecx: u32, read_xcr0: X, read_leaf7_ebx: L) -> bool
+where
+    X: FnOnce() -> u64,
+    L: FnOnce() -> u32,
+{
+    if max_basic_leaf < 7 || leaf1_ecx & AVX_LEAF1_MASK != AVX_LEAF1_MASK {
+        return false;
+    }
+    select_avx2(max_basic_leaf, leaf1_ecx, read_xcr0(), read_leaf7_ebx())
+}
+
+fn select_avx2(max_basic_leaf: u32, leaf1_ecx: u32, xcr0: u64, leaf7_ebx: u32) -> bool {
+    max_basic_leaf >= 7
+        && leaf1_ecx & AVX_LEAF1_MASK == AVX_LEAF1_MASK
+        && xcr0 & AVX_STATE_MASK == AVX_STATE_MASK
+        && leaf7_ebx & (1 << 5) != 0
+}
+
+unsafe fn xgetbv0() -> u64 {
+    let low: u32;
+    let high: u32;
+    asm!(
+        "xgetbv",
+        in("ecx") 0u32,
+        lateout("eax") low,
+        lateout("edx") high,
+        options(nomem, nostack, preserves_flags),
+    );
+    u64::from(low) | (u64::from(high) << 32)
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use core::cell::Cell;
+
+    use super::{resolve_avx2, select_avx2, AVX_LEAF1_MASK};
+
+    #[test]
+    fn avx2_selector_requires_every_cpu_and_os_prerequisite() {
+        let avx2 = 1 << 5;
+        assert!(!select_avx2(6, AVX_LEAF1_MASK, 0x6, avx2));
+        assert!(!select_avx2(7, AVX_LEAF1_MASK & !(1 << 26), 0x6, avx2));
+        assert!(!select_avx2(7, AVX_LEAF1_MASK & !(1 << 27), 0x6, avx2));
+        assert!(!select_avx2(7, AVX_LEAF1_MASK & !(1 << 28), 0x6, avx2));
+        assert!(!select_avx2(7, AVX_LEAF1_MASK, 0x4, avx2));
+        assert!(!select_avx2(7, AVX_LEAF1_MASK, 0x2, avx2));
+        assert!(!select_avx2(7, AVX_LEAF1_MASK, 0x6, 0));
+        assert!(select_avx2(7, AVX_LEAF1_MASK, 0x6, avx2));
+    }
+
+    #[test]
+    fn avx2_detection_does_not_read_xcr0_without_osxsave() {
+        let xgetbv_called = Cell::new(false);
+        let selected = resolve_avx2(
+            7,
+            AVX_LEAF1_MASK & !(1 << 27),
+            || {
+                xgetbv_called.set(true);
+                0x6
+            },
+            || 1 << 5,
+        );
+        assert!(!selected);
+        assert!(!xgetbv_called.get());
+    }
+}
 
 static ROPE_TABLE: &[u8; 8_388_608] = include_bytes!("../../../fixtures/analytic/rope-table.f32le");
 static INFERENCE_ROPE_TABLE: &[u8; 8_388_608] =
@@ -754,6 +866,33 @@ pub(crate) unsafe fn inference_exit_fp(previous: u32) {
     );
 }
 
+#[cfg(test)]
+pub(crate) unsafe fn inference_clear_fp_exceptions_for_test() {
+    let mut current = 0u32;
+    asm!(
+        "stmxcsr dword ptr [{current}]",
+        current = in(reg) &mut current,
+        options(nostack, preserves_flags),
+    );
+    current &= !0x3f;
+    asm!(
+        "ldmxcsr dword ptr [{current}]",
+        current = in(reg) &current,
+        options(nostack, preserves_flags),
+    );
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn inference_fp_exceptions_for_test() -> u32 {
+    let mut current = 0u32;
+    asm!(
+        "stmxcsr dword ptr [{current}]",
+        current = in(reg) &mut current,
+        options(nostack, preserves_flags),
+    );
+    current & 0x3f
+}
+
 #[target_feature(enable = "sse2")]
 pub(crate) unsafe fn inference_q4_row(
     weights: *const u8,
@@ -817,7 +956,7 @@ unsafe fn round_half_away(value: u32) -> i32 {
 const INFERENCE_Q8_STAGING_BYTES: usize = 5_184;
 
 #[target_feature(enable = "sse2")]
-unsafe fn inference_quantize_q8(input: *const u8, staging: *mut u8, columns: usize) {
+pub(crate) unsafe fn inference_prepare_q8(input: *const u8, staging: *mut u8, columns: usize) {
     ptr::write_bytes(staging, 0, INFERENCE_Q8_STAGING_BYTES);
     for block_index in 0..(columns >> 5) {
         let input_base = block_index * 32;
@@ -848,7 +987,7 @@ pub(crate) fn inference_quantize_q8_for_test(input: &[u32], staging: &mut [u8]) 
     assert!(input.len() % 32 == 0 && input.len() <= 4_864);
     assert!(staging.len() >= INFERENCE_Q8_STAGING_BYTES);
     unsafe {
-        inference_quantize_q8(
+        inference_prepare_q8(
             input.as_ptr().cast::<u8>(),
             staging.as_mut_ptr(),
             input.len(),
@@ -974,6 +1113,56 @@ global_asm!(
     "movd eax, xmm5",
     "ret",
     ".p2align 4",
+    ".globl promptboot_inference_q4_block_dot_avx2",
+    "promptboot_inference_q4_block_dot_avx2:",
+    "vmovdqu xmm0, xmmword ptr [rcx]",
+    "vpand xmm1, xmm0, xmmword ptr [rip + .Lpromptboot_q4_nibble_mask]",
+    "vpsrlw xmm0, xmm0, 4",
+    "vpand xmm0, xmm0, xmmword ptr [rip + .Lpromptboot_q4_nibble_mask]",
+    "vpsubb xmm1, xmm1, xmmword ptr [rip + .Lpromptboot_q4_zero_point]",
+    "vpsubb xmm0, xmm0, xmmword ptr [rip + .Lpromptboot_q4_zero_point]",
+    "vpmovsxbw ymm1, xmm1",
+    "vpmovsxbw ymm0, xmm0",
+    "vmovdqu xmm2, xmmword ptr [rdx]",
+    "vmovdqu xmm3, xmmword ptr [rdx + 16]",
+    "vpmovsxbw ymm2, xmm2",
+    "vpmovsxbw ymm3, xmm3",
+    "vpmaddwd ymm1, ymm1, ymm2",
+    "vpmaddwd ymm0, ymm0, ymm3",
+    "vpaddd ymm0, ymm0, ymm1",
+    "vextracti128 xmm1, ymm0, 1",
+    "vpaddd xmm0, xmm0, xmm1",
+    "vpsrldq xmm1, xmm0, 8",
+    "vpaddd xmm0, xmm0, xmm1",
+    "vpsrldq xmm1, xmm0, 4",
+    "vpaddd xmm0, xmm0, xmm1",
+    "vmovd eax, xmm0",
+    "vzeroupper",
+    "ret",
+    ".p2align 4",
+    ".globl promptboot_inference_q8_block_dot_avx2",
+    "promptboot_inference_q8_block_dot_avx2:",
+    "vmovdqu ymm0, ymmword ptr [rcx]",
+    "vmovdqu ymm1, ymmword ptr [rdx]",
+    "vextracti128 xmm2, ymm0, 1",
+    "vextracti128 xmm3, ymm1, 1",
+    "vpmovsxbw ymm0, xmm0",
+    "vpmovsxbw ymm1, xmm1",
+    "vpmovsxbw ymm2, xmm2",
+    "vpmovsxbw ymm3, xmm3",
+    "vpmaddwd ymm0, ymm0, ymm1",
+    "vpmaddwd ymm2, ymm2, ymm3",
+    "vpaddd ymm0, ymm0, ymm2",
+    "vextracti128 xmm1, ymm0, 1",
+    "vpaddd xmm0, xmm0, xmm1",
+    "vpsrldq xmm1, xmm0, 8",
+    "vpaddd xmm0, xmm0, xmm1",
+    "vpsrldq xmm1, xmm0, 4",
+    "vpaddd xmm0, xmm0, xmm1",
+    "vmovd eax, xmm0",
+    "vzeroupper",
+    "ret",
+    ".p2align 4",
     ".Lpromptboot_q4_nibble_mask:",
     ".byte 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15",
     ".Lpromptboot_q4_zero_point:",
@@ -982,39 +1171,70 @@ global_asm!(
 
 extern "efiapi" {
     #[link_name = "promptboot_inference_q4_block_dot"]
-    fn inference_q4_block_dot(weights: *const u8, activation: *const u8) -> i32;
+    fn inference_q4_block_dot_sse2(weights: *const u8, activation: *const u8) -> i32;
     #[link_name = "promptboot_inference_q8_block_dot"]
-    fn inference_q8_block_dot(weights: *const u8, activation: *const u8) -> i32;
+    fn inference_q8_block_dot_sse2(weights: *const u8, activation: *const u8) -> i32;
+    #[link_name = "promptboot_inference_q4_block_dot_avx2"]
+    fn inference_q4_block_dot_avx2(weights: *const u8, activation: *const u8) -> i32;
+    #[link_name = "promptboot_inference_q8_block_dot_avx2"]
+    fn inference_q8_block_dot_avx2(weights: *const u8, activation: *const u8) -> i32;
 }
 
 #[cfg(test)]
-pub(crate) fn inference_q4_block_dot_for_test(weights: &[u8; 16], activation: &[i8; 32]) -> i32 {
-    unsafe { inference_q4_block_dot(weights.as_ptr(), activation.as_ptr().cast()) }
+pub(crate) fn inference_q4_block_dot_for_test(
+    backend: InferenceBackend,
+    weights: &[u8; 16],
+    activation: &[i8; 32],
+) -> i32 {
+    unsafe { q4_block_dot(backend)(weights.as_ptr(), activation.as_ptr().cast()) }
 }
 
 #[cfg(test)]
-pub(crate) fn inference_q8_block_dot_for_test(weights: &[i8; 32], activation: &[i8; 32]) -> i32 {
-    unsafe { inference_q8_block_dot(weights.as_ptr().cast(), activation.as_ptr().cast()) }
+pub(crate) fn inference_q8_block_dot_for_test(
+    backend: InferenceBackend,
+    weights: &[i8; 32],
+    activation: &[i8; 32],
+) -> i32 {
+    unsafe { q8_block_dot(backend)(weights.as_ptr().cast(), activation.as_ptr().cast()) }
+}
+
+type BlockDot = unsafe extern "efiapi" fn(*const u8, *const u8) -> i32;
+
+fn q4_block_dot(backend: InferenceBackend) -> BlockDot {
+    match backend {
+        InferenceBackend::Sse2 => inference_q4_block_dot_sse2,
+        InferenceBackend::Avx2 => inference_q4_block_dot_avx2,
+    }
+}
+
+fn q8_block_dot(backend: InferenceBackend) -> BlockDot {
+    match backend {
+        InferenceBackend::Sse2 => inference_q8_block_dot_sse2,
+        InferenceBackend::Avx2 => inference_q8_block_dot_avx2,
+    }
 }
 
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn inference_q4_matvec(
+pub(crate) unsafe fn inference_q4_matvec_rows_prepared(
+    backend: InferenceBackend,
     weights: *const u8,
-    input: *const u8,
     output: *mut u8,
     staging: *mut u8,
     rows: usize,
     columns: usize,
+    first: usize,
+    end: usize,
 ) {
-    inference_quantize_q8(input, staging, columns);
+    debug_assert!(first <= end && end <= rows);
     let blocks_per_row = columns >> 5;
-    for row in 0..rows {
+    let block_dot = q4_block_dot(backend);
+    for row in first..end {
         let mut total = 0u32;
         let row_base = weights.add(row * blocks_per_row * 18);
         for block_index in 0..blocks_per_row {
             let block = row_base.add(block_index * 18);
             let activation = staging.add(block_index * 34);
-            let integer = inference_q4_block_dot(block.add(2), activation.add(2));
+            let integer = block_dot(block.add(2), activation.add(2));
             let weight_scale = half_to_f32_bits(u16::from_le(ptr::read_unaligned(block.cast())));
             let activation_scale =
                 half_to_f32_bits(u16::from_le(ptr::read_unaligned(activation.cast())));
@@ -1025,27 +1245,29 @@ pub(crate) unsafe fn inference_q4_matvec(
         }
         write_bits(output, row, total);
     }
-    ptr::write_bytes(staging, 0, INFERENCE_Q8_STAGING_BYTES);
 }
 
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn inference_q8_matvec(
+pub(crate) unsafe fn inference_q8_matvec_rows_prepared(
+    backend: InferenceBackend,
     weights: *const u8,
-    input: *const u8,
     output: *mut u32,
     staging: *mut u8,
     rows: usize,
     columns: usize,
+    first: usize,
+    end: usize,
 ) {
-    inference_quantize_q8(input, staging, columns);
+    debug_assert!(first <= end && end <= rows);
     let blocks_per_row = columns >> 5;
-    for row in 0..rows {
+    let block_dot = q8_block_dot(backend);
+    for row in first..end {
         let mut total = 0u32;
         let row_base = weights.add(row * blocks_per_row * 34);
         for block_index in 0..blocks_per_row {
             let block = row_base.add(block_index * 34);
             let activation = staging.add(block_index * 34);
-            let integer = inference_q8_block_dot(block.add(2), activation.add(2));
+            let integer = block_dot(block.add(2), activation.add(2));
             let weight_scale = half_to_f32_bits(u16::from_le(ptr::read_unaligned(block.cast())));
             let activation_scale =
                 half_to_f32_bits(u16::from_le(ptr::read_unaligned(activation.cast())));
@@ -1056,7 +1278,6 @@ pub(crate) unsafe fn inference_q8_matvec(
         }
         ptr::write(output.add(row), total);
     }
-    ptr::write_bytes(staging, 0, INFERENCE_Q8_STAGING_BYTES);
 }
 
 #[target_feature(enable = "sse2")]
@@ -1117,6 +1338,10 @@ pub(crate) unsafe fn inference_rmsnorm(
 unsafe fn inference_expf4_in_place(values: *mut u32) {
     for lane in 0..4 {
         let value = ptr::read_unaligned(values.add(lane));
+        if value == 0xff80_0000 {
+            ptr::write_unaligned(values.add(lane), 0);
+            continue;
+        }
         let z = add(mul(value, 0x3fb8_aa3b), 0x4b40_0000);
         let n = sub(z, 0x4b40_0000);
         let inner = sub(value, mul(n, 0x3f31_7200));
@@ -1202,19 +1427,167 @@ pub(crate) unsafe fn inference_rope_in_place(values: *mut u8, heads: usize, posi
     }
 }
 
-const fn inference_kv_word(
+#[target_feature(enable = "sse2")]
+unsafe fn attention_scores_sse2(
+    query: *const u8,
+    kv: *const u8,
+    scores: *mut u8,
     layer: usize,
-    kind: usize,
-    position: usize,
-    head: usize,
-    component: usize,
-) -> usize {
-    ((((layer * 2 + kind) * crate::inference::CONTEXT_LIMIT as usize + position) * 2 + head) * 64)
-        + component
+    query_head: usize,
+    kv_head: usize,
+    positions: usize,
+) {
+    for position in 0..positions {
+        let mut dot = 0u64;
+        for component in 0..64 {
+            let key = crate::inference::kv_word(layer, 0, position, kv_head, component);
+            dot = f64_add(
+                dot,
+                f32_to_f64(mul(
+                    read_bits(query, query_head * 64 + component),
+                    read_bits(kv, key),
+                )),
+            );
+        }
+        write_bits(scores, position, mul(f64_to_f32(dot), 0x3e00_0000));
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn attention_maskload4(source: *const f32, remaining: usize) -> [u32; 4] {
+    let mask = [
+        if remaining > 0 { u32::MAX } else { 0 },
+        if remaining > 1 { u32::MAX } else { 0 },
+        if remaining > 2 { u32::MAX } else { 0 },
+        if remaining > 3 { u32::MAX } else { 0 },
+    ];
+    let mut output = [0u32; 4];
+    let mut saved = [0u8; 32];
+    asm!(
+        "vmovdqu xmmword ptr [{saved}], xmm0",
+        "vmovdqu xmmword ptr [{saved} + 16], xmm1",
+        "vmovdqu xmm0, xmmword ptr [{mask}]",
+        "vmaskmovps xmm1, xmm0, xmmword ptr [{source}]",
+        "vmovdqu xmmword ptr [{output}], xmm1",
+        "vmovdqu xmm1, xmmword ptr [{saved} + 16]",
+        "vmovdqu xmm0, xmmword ptr [{saved}]",
+        mask = in(reg) mask.as_ptr(),
+        source = in(reg) source,
+        output = in(reg) output.as_mut_ptr(),
+        saved = in(reg) saved.as_mut_ptr(),
+        options(nostack, preserves_flags),
+    );
+    output
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn attention_scores_avx2(
+    query: *const u8,
+    kv: *const u8,
+    scores: *mut u8,
+    layer: usize,
+    query_head: usize,
+    kv_head: usize,
+    positions: usize,
+    softmax_span: usize,
+) {
+    let scale = _mm_castsi128_ps(_mm_set1_epi32(0x3e00_0000u32 as i32));
+    for position in (0..softmax_span).step_by(4) {
+        let remaining = positions.saturating_sub(position).min(4);
+        let mut low = _mm_setzero_pd();
+        let mut high = _mm_setzero_pd();
+        for component in 0..64 {
+            let query_bits = read_bits(query, query_head * 64 + component);
+            let query_lanes = _mm_castsi128_ps(_mm_set1_epi32(query_bits as i32));
+            let key = crate::inference::kv_word(layer, 0, position, kv_head, component) * 4;
+            let keys = if remaining == 4 {
+                _mm_loadu_ps(kv.add(key).cast::<f32>())
+            } else {
+                let loaded = attention_maskload4(kv.add(key).cast::<f32>(), remaining);
+                _mm_loadu_ps(loaded.as_ptr().cast::<f32>())
+            };
+            let products = _mm_mul_ps(query_lanes, keys);
+            low = _mm_add_pd(low, _mm_cvtps_pd(products));
+            high = _mm_add_pd(high, _mm_cvtps_pd(_mm_movehl_ps(products, products)));
+        }
+        let mut converted = [0u32; 8];
+        _mm_storeu_ps(converted.as_mut_ptr().cast::<f32>(), _mm_cvtpd_ps(low));
+        _mm_storeu_ps(
+            converted.as_mut_ptr().add(4).cast::<f32>(),
+            _mm_cvtpd_ps(high),
+        );
+        let dot_bits = [converted[0], converted[1], converted[4], converted[5]];
+        let scaled = _mm_mul_ps(_mm_loadu_ps(dot_bits.as_ptr().cast::<f32>()), scale);
+        _mm_storeu_ps(scores.add(position * 4).cast::<f32>(), scaled);
+    }
+    asm!("vzeroupper", options(nomem, nostack, preserves_flags));
 }
 
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn inference_attention(
+unsafe fn attention_values_sse2(
+    kv: *const u8,
+    probabilities: *const u8,
+    output: *mut u8,
+    layer: usize,
+    query_head: usize,
+    kv_head: usize,
+    positions: usize,
+) {
+    for component in 0..64 {
+        let mut total = 0u64;
+        for position in 0..positions {
+            let value = crate::inference::kv_word(layer, 1, position, kv_head, component);
+            total = f64_add(
+                total,
+                f32_to_f64(mul(
+                    read_bits(probabilities, position),
+                    read_bits(kv, value),
+                )),
+            );
+        }
+        write_bits(output, query_head * 64 + component, f64_to_f32(total));
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn attention_values_avx2(
+    kv: *const u8,
+    probabilities: *const u8,
+    output: *mut u8,
+    layer: usize,
+    query_head: usize,
+    kv_head: usize,
+    positions: usize,
+) {
+    for component in (0..64).step_by(4) {
+        let mut low = _mm_setzero_pd();
+        let mut high = _mm_setzero_pd();
+        for position in 0..positions {
+            let probability =
+                _mm_castsi128_ps(_mm_set1_epi32(read_bits(probabilities, position) as i32));
+            let value = crate::inference::kv_word(layer, 1, position, kv_head, component) * 4;
+            let products = _mm_mul_ps(probability, _mm_loadu_ps(kv.add(value).cast::<f32>()));
+            low = _mm_add_pd(low, _mm_cvtps_pd(products));
+            high = _mm_add_pd(high, _mm_cvtps_pd(_mm_movehl_ps(products, products)));
+        }
+        let mut converted = [0u32; 8];
+        _mm_storeu_ps(converted.as_mut_ptr().cast::<f32>(), _mm_cvtpd_ps(low));
+        _mm_storeu_ps(
+            converted.as_mut_ptr().add(4).cast::<f32>(),
+            _mm_cvtpd_ps(high),
+        );
+        let total_bits = [converted[0], converted[1], converted[4], converted[5]];
+        ptr::copy_nonoverlapping(
+            total_bits.as_ptr(),
+            output.cast::<u32>().add(query_head * 64 + component),
+            4,
+        );
+    }
+    asm!("vzeroupper", options(nomem, nostack, preserves_flags));
+}
+
+#[target_feature(enable = "sse2")]
+unsafe fn inference_attention_inner<const AVX2: bool, const CAPTURE: bool>(
     query: *const u8,
     kv: *const u8,
     output: *mut u8,
@@ -1222,36 +1595,46 @@ pub(crate) unsafe fn inference_attention(
     layer: usize,
     current_position: usize,
     softmax_span: usize,
+    raw_scores: *mut u32,
+    normalized_probabilities: *mut u32,
 ) {
     let positions = current_position + 1;
     debug_assert!(
         softmax_span >= positions && softmax_span <= crate::inference::CONTEXT_LIMIT as usize
     );
     debug_assert_eq!(softmax_span & 3, 0);
-    let scale = 0x3e00_0000; // exactly 1/sqrt(64)
     for query_head in 0..14 {
         let kv_head = unsigned_divide(query_head, 7);
+        if AVX2 {
+            attention_scores_avx2(
+                query,
+                kv,
+                scores,
+                layer,
+                query_head,
+                kv_head,
+                positions,
+                softmax_span,
+            );
+        } else {
+            attention_scores_sse2(query, kv, scores, layer, query_head, kv_head, positions);
+        }
         let mut maximum = 0xff80_0000;
         for position in 0..positions {
-            let mut dot = 0u64;
-            for component in 0..64 {
-                let key = inference_kv_word(layer, 0, position, kv_head, component);
-                dot = f64_add(
-                    dot,
-                    f32_to_f64(mul(
-                        read_bits(query, query_head * 64 + component),
-                        read_bits(kv, key),
-                    )),
-                );
-            }
-            let score = mul(f64_to_f32(dot), scale);
-            write_bits(scores, position, score);
+            let score = read_bits(scores, position);
             if greater(score, maximum) {
                 maximum = score;
             }
         }
         for masked in positions..softmax_span {
             write_bits(scores, masked, 0xff80_0000);
+        }
+        if CAPTURE {
+            ptr::copy_nonoverlapping(
+                scores.cast::<u32>(),
+                raw_scores.add(query_head * softmax_span),
+                softmax_span,
+            );
         }
         let mut sum = 0u64;
         let mut position = 0usize;
@@ -1273,17 +1656,95 @@ pub(crate) unsafe fn inference_attention(
                 mul(read_bits(scores, position), normalizer),
             );
         }
-        for component in 0..64 {
-            let mut total = 0u64;
-            for position in 0..positions {
-                let value = inference_kv_word(layer, 1, position, kv_head, component);
-                total = f64_add(
-                    total,
-                    f32_to_f64(mul(read_bits(scores, position), read_bits(kv, value))),
-                );
-            }
-            write_bits(output, query_head * 64 + component, f64_to_f32(total));
+        if CAPTURE {
+            ptr::copy_nonoverlapping(
+                scores.cast::<u32>(),
+                normalized_probabilities.add(query_head * softmax_span),
+                softmax_span,
+            );
         }
+        if AVX2 {
+            attention_values_avx2(kv, scores, output, layer, query_head, kv_head, positions);
+        } else {
+            attention_values_sse2(kv, scores, output, layer, query_head, kv_head, positions);
+        }
+    }
+}
+
+#[target_feature(enable = "sse2")]
+pub(crate) unsafe fn inference_attention(
+    backend: InferenceBackend,
+    query: *const u8,
+    kv: *const u8,
+    output: *mut u8,
+    scores: *mut u8,
+    layer: usize,
+    current_position: usize,
+    softmax_span: usize,
+) {
+    match backend {
+        InferenceBackend::Sse2 => inference_attention_inner::<false, false>(
+            query,
+            kv,
+            output,
+            scores,
+            layer,
+            current_position,
+            softmax_span,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        ),
+        InferenceBackend::Avx2 => inference_attention_inner::<true, false>(
+            query,
+            kv,
+            output,
+            scores,
+            layer,
+            current_position,
+            softmax_span,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        ),
+    }
+}
+
+#[cfg(test)]
+#[target_feature(enable = "sse2")]
+pub(crate) unsafe fn inference_attention_captured_for_test(
+    backend: InferenceBackend,
+    query: *const u8,
+    kv: *const u8,
+    output: *mut u8,
+    scores: *mut u8,
+    layer: usize,
+    current_position: usize,
+    softmax_span: usize,
+    raw_scores: *mut u32,
+    probabilities: *mut u32,
+) {
+    match backend {
+        InferenceBackend::Sse2 => inference_attention_inner::<false, true>(
+            query,
+            kv,
+            output,
+            scores,
+            layer,
+            current_position,
+            softmax_span,
+            raw_scores,
+            probabilities,
+        ),
+        InferenceBackend::Avx2 => inference_attention_inner::<true, true>(
+            query,
+            kv,
+            output,
+            scores,
+            layer,
+            current_position,
+            softmax_span,
+            raw_scores,
+            probabilities,
+        ),
     }
 }
 

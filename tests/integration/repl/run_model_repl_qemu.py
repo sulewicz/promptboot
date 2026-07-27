@@ -20,6 +20,8 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "scripts"))
 from host_check import HostError, check  # noqa: E402
 from event_topology import (  # noqa: E402
+    EVENT_DISPLAY_OFF_FRAME,
+    EVENT_DISPLAY_ON_FRAME,
     POLLING_PREFIX,
     STRICT_FINAL,
     TOGGLE_V1,
@@ -28,6 +30,9 @@ from event_topology import (  # noqa: E402
 from qmp_session import QmpSession  # noqa: E402
 
 PREFIX = b"PROMPTBOOT_EVENT v=1 "
+CLEAR_SCREEN_ESCAPE = b"\x1b[2J"
+QEMU_TEXT_COLUMNS = 160
+QEMU_TEXT_ROWS = 42
 
 _REQUIRED_FIELD_ROWS = {
     "STARTED": ("event", "build_id", "firmware", "console", "evidence", "uefi_conventional_bytes", "sse2", "watchdog"),
@@ -37,13 +42,15 @@ _REQUIRED_FIELD_ROWS = {
     "MODEL_READ_COMPLETE": ("event", "bytes", "max_chunk", "eof_probe_bytes"),
     "MODEL_VERIFIED": ("event", "format", "version", "sha256", "source_sha256", "tensors", "vocab"),
     "MODEL_ARENAS_READY": ("event", "regions", "pages", "committed", "aligned", "nonoverlap", "canaries", "prompt_slack", "index_sha256"),
+    "MP_INFERENCE_MODE": ("event", "mode", "reason", "total", "enabled"),
+    "RUNTIME_STATUS": ("event", "state", "cpu_mode", "cpu_active", "cpu_workers", "cpu_enabled", "cpu_total", "memory_baseline", "memory_free", "memory_consumed_since_boot", "committed_tokens", "engine_position", "context_limit", "generation_reserve"),
     "MODEL_REPL_READY": ("event", "mode", "model_sha256", "index_sha256", "context", "max_new_tokens", "prompt_bytes", "history", "timing_class", "sampling", "sampling_seed", "sampling_seed_source", "interrupt_input"),
     "PROMPT_READY": ("event", "prompt_index", "input_limit", "history_turns", "history_tokens", "reserve", "sampling_draws"),
     "INPUT_ACCEPTED": ("event", "prompt_index", "bytes", "accepted_tsc"),
     "INPUT_REJECTED": ("event", "prompt_index", "code", "limit"),
     "HISTORY_RESET": ("event", "prompt_index", "prior_turns", "prior_tokens", "reason"),
     "CONTEXT_REJECTED": ("event", "prompt_index", "user_tokens", "fresh_prompt_tokens", "limit", "reserve", "code"),
-    "PROMPT_TOKENIZED": ("event", "prompt_index", "user_tokens", "history_tokens", "prompt_tokens", "reserve", "reset"),
+    "PROMPT_TOKENIZED": ("event", "prompt_index", "user_tokens", "history_tokens", "prompt_tokens", "prefix_tokens", "reserve", "reset"),
     "GENERATION_STARTED": ("event", "prompt_index", "accepted_tsc", "prompt_tokens", "limit", "cached_tokens", "start_tsc"),
     "TOKEN": ("event", "prompt_index", "token_index", "id", "kind", "piece_bytes", "utf16_units", "infer_start_tsc", "infer_end_tsc", "output_start_tsc", "output_end_tsc"),
     "GENERATION_COMPLETE": ("event", "prompt_index", "reason", "generated", "visible_tokens", "visible_utf16_units", "committed", "history_turns", "history_tokens", "start_tsc", "end_tsc"),
@@ -237,7 +244,21 @@ def human_stream(payload: bytes, records: list[bytes], prompt_index: int) -> byt
             token_index=0,
         )
     )
-    return human_stream_before(payload, records, prompt_index, token)
+    return normalize_human_stream(
+        human_stream_before(payload, records, prompt_index, token)
+    )
+
+
+def normalize_human_stream(payload: bytes) -> bytes:
+    escape = rb"\x1b\[[0-9;?]*[A-Za-z]"
+    status = re.compile(
+        rb"\x1b\[001;001H(?:"
+        + escape
+        + rb"){3} promptboot \[(?:\||/|-|\\)\][^\x1b]*(?:"
+        + escape
+        + rb"){4}"
+    )
+    return re.sub(escape, b"", status.sub(b"", payload))
 
 
 def validate_oracle(
@@ -387,17 +408,74 @@ def wait_model_ready(
     raise TimeoutError("event=MODEL_REPL_READY")
 
 
+def pin_vcpu_threads(
+    session: QmpSession,
+    deadline: float,
+    vcpus: int,
+    evidence: Path,
+) -> list[dict[str, object]]:
+    allowed = sorted(os.sched_getaffinity(0))
+    physical = []
+    seen = set()
+    for cpu in allowed:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = int((topology / "physical_package_id").read_text().strip())
+            core = int((topology / "core_id").read_text().strip())
+        except (OSError, ValueError):
+            package, core = 0, cpu
+        if (package, core) not in seen:
+            seen.add((package, core))
+            physical.append((cpu, package, core))
+    selected = physical[:vcpus]
+    if len(selected) < vcpus:
+        used = {cpu for cpu, _, _ in selected}
+        selected.extend((cpu, 0, cpu) for cpu in allowed if cpu not in used)
+        selected = selected[:vcpus]
+    if len(selected) != vcpus:
+        raise RuntimeError(
+            f"insufficient allowed CPUs requested={vcpus} available={len(allowed)}"
+        )
+    response = session.command("query-cpus-fast", deadline)
+    rows = sorted(response.get("return", []), key=lambda row: int(row["cpu-index"]))
+    if len(rows) != vcpus:
+        raise RuntimeError(f"QMP vCPU thread count expected={vcpus} actual={len(rows)}")
+    result = []
+    for row, (cpu, package, core) in zip(rows, selected):
+        thread_id = int(row["thread-id"])
+        os.sched_setaffinity(thread_id, {cpu})
+        actual = sorted(os.sched_getaffinity(thread_id))
+        if actual != [cpu]:
+            raise RuntimeError(f"vCPU affinity tid={thread_id} expected={cpu} actual={actual}")
+        result.append({
+            "core_id": core,
+            "cpu_index": int(row["cpu-index"]),
+            "host_cpu": cpu,
+            "physical_package_id": package,
+            "thread_id": thread_id,
+        })
+    (evidence / "cpu-affinity.json").write_text(
+        json.dumps(result, sort_keys=True, indent=2) + "\n",
+        encoding="ascii",
+    )
+    return result
+
+
 RUN_OUTPUTS = (
     "com1.log",
+    "cpu-affinity.json",
     "OVMF_VARS.fd",
     "qmp.sock",
     "qemu-command.json",
     "process-tree.txt",
     "failure.txt",
     "firmware-console.ppm",
+    "scroll-live.ppm",
     "scroll-bottom.ppm",
     "scroll-page-up.ppm",
     "scroll-page-down.ppm",
+    "status-tick-a.ppm",
+    "status-tick-b.ppm",
     "qemu-stderr.log",
     "qmp-transcript.json",
     "outcome.json",
@@ -479,6 +557,7 @@ def wait_screen_hash(
     path: Path,
     expected: str,
     equal: bool,
+    expected_status: str,
 ) -> str:
     screen_deadline = min(deadline, time.monotonic() + 5.0)
     while time.monotonic() < screen_deadline:
@@ -486,8 +565,11 @@ def wait_screen_hash(
             "screendump", deadline, {"filename": str(path)}
         ):
             raise RuntimeError("screendump failed")
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if (digest == expected) == equal:
+        digest = masked_screen_digest(path)
+        if (
+            (digest == expected) == equal
+            and status_row_digest(path) == expected_status
+        ):
             return digest
         time.sleep(0.01)
     relation = "match" if equal else "change from"
@@ -506,12 +588,106 @@ def wait_stable_screen(
             "screendump", deadline, {"filename": str(path)}
         ):
             raise RuntimeError("screendump failed")
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = masked_screen_digest(path)
         if digest == previous:
             return digest
         previous = digest
         time.sleep(0.05)
     raise TimeoutError("firmware screen did not settle")
+
+
+def ppm_pixels(path: Path) -> tuple[int, int, bytes]:
+    payload = path.read_bytes()
+    header_end = 0
+    fields = []
+    while len(fields) < 4:
+        line_end = payload.find(b"\n", header_end)
+        if line_end < 0:
+            raise ValueError("truncated PPM")
+        line = payload[header_end:line_end]
+        header_end = line_end + 1
+        if line.startswith(b"#"):
+            continue
+        fields.extend(line.split())
+    if fields[0] != b"P6" or fields[3] != b"255":
+        raise ValueError("unsupported PPM")
+    width, height = int(fields[1]), int(fields[2])
+    pixels = payload[header_end:]
+    if len(pixels) != width * height * 3:
+        raise ValueError("PPM payload length")
+    return width, height, pixels
+
+
+def masked_screen_digest(path: Path) -> str:
+    width, height, pixels = ppm_pixels(path)
+    row_height = max(1, (height + QEMU_TEXT_ROWS - 1) // QEMU_TEXT_ROWS)
+    visible = pixels[width * row_height * 3 :]
+    return hashlib.sha256(visible).hexdigest()
+
+
+def status_row_digest(path: Path) -> str:
+    width, height, pixels = ppm_pixels(path)
+    row_height = max(1, (height + QEMU_TEXT_ROWS - 1) // QEMU_TEXT_ROWS)
+    cell_width = max(1, width // QEMU_TEXT_COLUMNS)
+    spinner_start = 13 * cell_width
+    spinner_end = 14 * cell_width
+    safe_end = width - cell_width
+    selected = bytearray()
+    for row in range(row_height):
+        row_start = row * width * 3
+        selected.extend(pixels[row_start : row_start + spinner_start * 3])
+        selected.extend(
+            pixels[row_start + spinner_end * 3 : row_start + safe_end * 3]
+        )
+    return hashlib.sha256(selected).hexdigest()
+
+
+def wait_status_animation(
+    session: QmpSession,
+    deadline: float,
+    first: Path,
+    second: Path,
+) -> None:
+    if "return" not in session.command(
+        "screendump", deadline, {"filename": str(first)}
+    ):
+        raise RuntimeError("screendump failed")
+    first_width, first_height, first_pixels = ppm_pixels(first)
+    first_masked = masked_screen_digest(first)
+    first_raw = hashlib.sha256(first.read_bytes()).hexdigest()
+    animation_deadline = min(deadline, time.monotonic() + 3.0)
+    while time.monotonic() < animation_deadline:
+        time.sleep(0.05)
+        if "return" not in session.command(
+            "screendump", deadline, {"filename": str(second)}
+        ):
+            raise RuntimeError("screendump failed")
+        if (
+            hashlib.sha256(second.read_bytes()).hexdigest() == first_raw
+        ):
+            continue
+        if masked_screen_digest(second) != first_masked:
+            shutil.copyfile(second, first)
+            first_width, first_height, first_pixels = ppm_pixels(first)
+            first_masked = masked_screen_digest(first)
+            first_raw = hashlib.sha256(first.read_bytes()).hexdigest()
+            continue
+        width, height, pixels = ppm_pixels(second)
+        if (width, height) != (first_width, first_height):
+            raise ValueError("screen geometry changed")
+        row_height = max(1, (height + QEMU_TEXT_ROWS - 1) // QEMU_TEXT_ROWS)
+        cell_width = max(1, width // QEMU_TEXT_COLUMNS)
+        safe_end = width - cell_width
+        for row in range(row_height):
+            row_start = row * width * 3
+            forbidden = slice(
+                row_start + safe_end * 3,
+                row_start + width * 3,
+            )
+            if first_pixels[forbidden] != pixels[forbidden]:
+                raise ValueError("status animation touched the unsafe final cell")
+        return
+    raise TimeoutError("status bar did not animate independently")
 
 
 def terminate_qemu(
@@ -553,6 +729,7 @@ def main() -> int:
     parser.add_argument("--esp", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--accel", choices=("kvm", "tcg"), required=True)
+    parser.add_argument("--vcpus", type=int, default=1)
     parser.add_argument("--prompt", default="color")
     parser.add_argument("--second-prompt")
     parser.add_argument("--third-prompt")
@@ -561,6 +738,8 @@ def main() -> int:
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--oracle", type=Path)
     parser.add_argument("--event-toggle-scenario", action="store_true")
+    parser.add_argument("--fixed-fallback-seed", action="store_true")
+    parser.add_argument("--force-sse2", action="store_true")
     args = parser.parse_args()
     prompts = [args.prompt]
     if args.second_prompt is not None:
@@ -576,6 +755,12 @@ def main() -> int:
         parser.error("diagnostic prompts must be nonempty printable ASCII")
     if args.event_toggle_scenario and (len(prompts) != 3 or rejected_prompts):
         parser.error("--event-toggle-scenario requires exactly three real prompts and no rejected prompt")
+    if args.fixed_fallback_seed and args.accel != "kvm":
+        parser.error("--fixed-fallback-seed requires --accel kvm")
+    if args.force_sse2 and args.accel != "kvm":
+        parser.error("--force-sse2 requires --accel kvm")
+    if args.vcpus < 1:
+        parser.error("--vcpus must be positive")
     try:
         manifest, _image_report = load_bound_inputs(args.esp, args.manifest)
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
@@ -609,10 +794,18 @@ def main() -> int:
     qemu = shutil.which("qemu-system-x86_64")
     if qemu is None:
         return 20
-    cpu = "host,invtsc=on" if args.accel == "kvm" else "max"
+    cpu = "max"
+    if args.accel == "kvm":
+        cpu = (
+            "host,invtsc=on,-rdrand,-rdseed"
+            if args.fixed_fallback_seed
+            else "host,invtsc=on"
+        )
+        if args.force_sse2:
+            cpu += ",-avx2"
     machine = "q35,kernel_irqchip=split" if args.accel == "kvm" else "q35"
     argv = [
-        "/usr/bin/taskset", "-c", "0", qemu, "-machine", machine, "-accel", args.accel,
+        qemu, "-machine", machine, "-accel", args.accel,
         "-cpu", cpu, "-m", "2048", "-smp", "1", "-nodefaults", "-no-reboot", "-nic", "none",
         "-display", "none", "-monitor", "none", "-device", "VGA",
         "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={host['ovmf_code']}",
@@ -621,6 +814,7 @@ def main() -> int:
         "-chardev", f"file,id=com1,path={serial}", "-device", "isa-serial,chardev=com1",
         "-qmp", f"unix:{qmp_path},server=on,wait=off", "-boot", "order=c,menu=off,strict=on",
     ]
+    argv[argv.index("-smp") + 1] = str(args.vcpus)
     (evidence / "qemu-command.json").write_text(json.dumps(argv, indent=2) + "\n", encoding="ascii")
     process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     start = time.monotonic()
@@ -629,14 +823,31 @@ def main() -> int:
     session = None
     result = {}
     shutdown = {"quit_acknowledged": False}
+    vcpu_affinity = []
     try:
+        session = QmpSession.connect(qmp_path, deadline)
+        if args.accel == "kvm":
+            vcpu_affinity = pin_vcpu_threads(
+                session,
+                deadline,
+                args.vcpus,
+                evidence,
+            )
         model_ready_seconds = wait_model_ready(
             serial,
             deadline,
             process,
             manifest["event_topology"],
         )
-        session = QmpSession.connect(qmp_path, deadline)
+        wait_status_animation(
+            session,
+            deadline,
+            evidence / "status-tick-a.ppm",
+            evidence / "status-tick-b.ppm",
+        )
+        initial_status = status_row_digest(evidence / "status-tick-a.ppm")
+        live_scroll_serial_start = serial.stat().st_size
+        live_scroll_serial_evidence = None
         process_tree = subprocess.check_output(["/usr/bin/ps", "-eo", "pid,ppid,comm,args"], text=True)
         if re.search(r"(^|/)repl_reference_extract(?:\s|$)|llama-(?:cli|server)", process_tree, re.MULTILINE):
             raise ValueError("host inference process coexists with QEMU")
@@ -644,15 +855,17 @@ def main() -> int:
         turn_results = []
         ignored_serial_ranges: list[tuple[int, int]] = []
         actions = (
-            [("help", index, "/help") for index in range(1, 6)]
+            [("help", index, "/help") for index in range(1, 5)]
             + [
+                ("status", 5, "/status"),
                 ("toggle", 6, "/events"),
                 ("prompt", 7, prompts[0]),
                 ("new", 8, "/new"),
-                ("prompt", 9, prompts[1]),
-                ("prompt", 10, prompts[2]),
-                ("interrupt", 11, "What can you do?"),
-                ("toggle", 12, "/events"),
+                ("status", 9, "/status"),
+                ("prompt", 10, prompts[1]),
+                ("prompt", 11, prompts[2]),
+                ("interrupt", 12, "What can you do?"),
+                ("toggle", 13, "/events"),
             ]
             if args.event_toggle_scenario
             else [("prompt", index, prompt) for index, prompt in enumerate(prompts, 1)]
@@ -695,7 +908,7 @@ def main() -> int:
                     prompt_index=prompt_index,
                 )
                 inject(session, deadline, "c", control=True)
-            if action in ("toggle", "help", "new"):
+            if action in ("toggle", "help", "new", "status"):
                 if action == "toggle":
                     event_display_enabled = not event_display_enabled
                 ready_host = wait_record(
@@ -714,6 +927,8 @@ def main() -> int:
                     "outcome": (
                         "HELP"
                         if action == "help"
+                        else "STATUS"
+                        if action == "status"
                         else "NEW_SESSION"
                         if action == "new"
                         else "EVENTS_ON"
@@ -725,6 +940,24 @@ def main() -> int:
                     "terminal_host_monotonic": ready_host,
                     "wall_seconds": ready_host - accepted_host,
                 })
+                if action == "help" and prompt_index == 4:
+                    live_scroll = evidence / "scroll-live.ppm"
+                    wait_stable_screen(session, deadline, live_scroll)
+                    if status_row_digest(live_scroll) != initial_status:
+                        raise ValueError("native live scrolling changed the top status row")
+                    live_scroll_serial_end = serial.stat().st_size
+                    live_scroll_serial = serial.read_bytes()[
+                        live_scroll_serial_start:live_scroll_serial_end
+                    ]
+                    if CLEAR_SCREEN_ESCAPE in live_scroll_serial:
+                        raise ValueError("native live scrolling cleared the screen")
+                    live_scroll_serial_evidence = {
+                        "bytes": len(live_scroll_serial),
+                        "clear_screen_sequences": 0,
+                        "end": live_scroll_serial_end,
+                        "sha256": hashlib.sha256(live_scroll_serial).hexdigest(),
+                        "start": live_scroll_serial_start,
+                    }
                 continue
             if prompt_index in rejected_prompts:
                 complete_host = None
@@ -775,23 +1008,32 @@ def main() -> int:
                     deadline,
                     scroll_bottom,
                 )
+                bottom_status = status_row_digest(scroll_bottom)
                 scroll_serial_start = serial.stat().st_size
                 inject(session, deadline, "pgup")
+                page_up = evidence / "scroll-page-up.ppm"
                 wait_screen_hash(
                     session,
                     deadline,
-                    evidence / "scroll-page-up.ppm",
+                    page_up,
                     bottom_hash,
                     False,
+                    bottom_status,
                 )
+                if status_row_digest(page_up) != bottom_status:
+                    raise ValueError("Page Up changed the status row")
                 inject(session, deadline, "pgdn")
+                page_down = evidence / "scroll-page-down.ppm"
                 wait_screen_hash(
                     session,
                     deadline,
-                    evidence / "scroll-page-down.ppm",
+                    page_down,
                     bottom_hash,
                     True,
+                    bottom_status,
                 )
+                if status_row_digest(page_down) != bottom_status:
+                    raise ValueError("Page Down changed the status row")
                 ignored_serial_ranges.append(
                     (scroll_serial_start, serial.stat().st_size)
                 )
@@ -815,11 +1057,33 @@ def main() -> int:
         physical = parsed_topology.physical_records
         records = list(parsed_topology.logical_records)
         validate_record_schemas(records)
+        if args.event_toggle_scenario and not any(
+            len(record.removesuffix(b"\r\n")) >= QEMU_TEXT_COLUMNS
+            for record in records
+        ):
+            raise ValueError("scroll scenario did not exercise a full-width content row")
         names = [fields(record)["event"] for record in records]
         token_count = sum(name == "TOKEN" for name in names)
         expected_complete = len(prompts) - len(rejected_prompts) + int(args.event_toggle_scenario)
         if token_count == 0 or names.count("GENERATION_COMPLETE") != expected_complete or names.count("CONTEXT_REJECTED") != len(rejected_prompts) or names[-1] != "PROMPT_READY":
             raise ValueError(f"incomplete REPL evidence {names}")
+        mp_mode = matching_records(records, "MP_INFERENCE_MODE")
+        if len(mp_mode) != 1:
+            raise ValueError("MP_INFERENCE_MODE count")
+        if args.accel == "kvm":
+            mp_fields = fields(mp_mode[0])
+            expected_mode, expected_reason = (
+                ("serial", "fewer_than_two_aps")
+                if args.vcpus < 3
+                else ("mp", "mp_services")
+            )
+            if (
+                mp_fields["mode"] != expected_mode
+                or mp_fields["reason"] != expected_reason
+                or int(mp_fields["total"]) != args.vcpus
+                or int(mp_fields["enabled"]) != args.vcpus
+            ):
+                raise ValueError("MP inference selection contract")
         repl_ready = matching_records(records, "MODEL_REPL_READY")
         if len(repl_ready) != 1:
             raise ValueError("MODEL_REPL_READY count")
@@ -843,10 +1107,41 @@ def main() -> int:
         for prompt_index, started_fields in started.items():
             history_tokens = int(tokenized[prompt_index]["history_tokens"])
             expected_cached = history_tokens - 1 if history_tokens else 0
-            if int(started_fields["cached_tokens"]) not in (0, expected_cached):
-                raise ValueError(f"generation cache contract prompt={prompt_index}")
+            if args.event_toggle_scenario:
+                expected_cached = {
+                    7: 0,
+                    10: 0,
+                    11: expected_cached,
+                    12: expected_cached,
+                }[prompt_index]
+            if int(started_fields["cached_tokens"]) != expected_cached:
+                raise ValueError(
+                    f"generation cache contract prompt={prompt_index} "
+                    f"expected={expected_cached} actual={started_fields['cached_tokens']}"
+                )
         if args.event_toggle_scenario:
-            for command_index in (1, 2, 3, 4, 5, 6, 8, 12):
+            runtime_status = matching_records(records, "RUNTIME_STATUS")
+            if len(runtime_status) != 2:
+                raise ValueError("RUNTIME_STATUS count")
+            expected_cpu_mode = "serial" if args.vcpus < 3 else "mp"
+            for record in runtime_status:
+                status_fields = fields(record)
+                if (
+                    status_fields["state"] != "waiting"
+                    or status_fields["cpu_mode"] != expected_cpu_mode
+                    or int(status_fields["cpu_active"]) != (1 if args.vcpus < 3 else args.vcpus)
+                    or int(status_fields["cpu_workers"]) != (0 if args.vcpus < 3 else args.vcpus - 1)
+                    or int(status_fields["cpu_enabled"]) != args.vcpus
+                    or int(status_fields["cpu_total"]) != args.vcpus
+                    or int(status_fields["memory_baseline"]) < int(status_fields["memory_free"])
+                    or int(status_fields["memory_consumed_since_boot"])
+                    != int(status_fields["memory_baseline"]) - int(status_fields["memory_free"])
+                    or status_fields["committed_tokens"] != "0"
+                    or status_fields["engine_position"] != "0"
+                    or status_fields["context_limit"] != "32768"
+                ):
+                    raise ValueError("runtime status snapshot contract")
+            for command_index in (1, 2, 3, 4, 5, 6, 8, 9, 13):
                 if any(
                     matching_records(
                         records,
@@ -874,12 +1169,12 @@ def main() -> int:
                 prompt_index: len(
                     matching_records(records, "TOKEN", prompt_index=prompt_index)
                 )
-                for prompt_index in (7, 9, 10)
+                for prompt_index in (7, 10, 11)
             }
             third_complete = matching_records(
                 records,
                 "GENERATION_COMPLETE",
-                prompt_index=10,
+                prompt_index=11,
             )
             if len(third_complete) != 1:
                 raise ValueError("third prompt completion contract")
@@ -891,36 +1186,40 @@ def main() -> int:
                 )
                 or prompt_fields[8]["history_turns"] != "1"
                 or prompt_fields[9]["history_turns"] != "0"
-                or prompt_fields[10]["history_turns"] != "1"
-                or int(prompt_fields[11]["history_turns"]) != turns_after_third
+                or prompt_fields[10]["history_turns"] != "0"
+                or prompt_fields[11]["history_turns"] != "1"
                 or int(prompt_fields[12]["history_turns"]) != turns_after_third
-                or int(prompt_fields[13]["history_turns"]) != turns_after_third
-                or int(started[10]["cached_tokens"])
-                != int(tokenized[10]["history_tokens"]) - 1
+                or int(prompt_fields[14]["history_turns"]) != turns_after_third
+                or int(started[11]["cached_tokens"])
+                != int(tokenized[11]["history_tokens"]) - 1
                 or any(sampling_draws[index] != 0 for index in range(1, 8))
                 or sampling_draws[8] == 0
                 or sampling_draws[8] != sampled_tokens[7]
                 or sampling_draws[9] != sampling_draws[8]
-                or sampling_draws[10] <= sampling_draws[9]
-                or sampling_draws[10] - sampling_draws[9] != sampled_tokens[9]
+                or sampling_draws[10] != sampling_draws[9]
                 or sampling_draws[11] <= sampling_draws[10]
                 or sampling_draws[11] - sampling_draws[10] != sampled_tokens[10]
-                or sampling_draws[12] not in (sampling_draws[11], sampling_draws[11] + 1)
-                or sampling_draws[13] != sampling_draws[12]
-                or payload.count(b"events: on\r\n") != 1
-                or payload.count(b"events: off\r\n") != 1
+                or sampling_draws[12] <= sampling_draws[11]
+                or sampling_draws[12] - sampling_draws[11] != sampled_tokens[11]
+                or sampling_draws[13] not in (sampling_draws[12], sampling_draws[12] + 1)
+                or sampling_draws[14] != sampling_draws[13]
+                or payload.count(EVENT_DISPLAY_ON_FRAME) != 1
+                or payload.count(EVENT_DISPLAY_OFF_FRAME) != 1
                 or payload.count(b"new session\r\n") != 1
-                or payload.count(b"Ctrl-C stops generation; /help lists commands.\r\n") != 1
-                or payload.count(b"^C\r\n") != 1
-                or payload.count(
-                    b"commands:\r\n"
-                    b"/events - toggle structured event display\r\n"
-                    b"/help - show this help\r\n"
-                    b"/new - clear the session and scrollback\r\n"
-                    b"Ctrl-C - stop generation\r\n"
-                    b"Page Up/Page Down - scroll output\r\n"
+                or b"Ctrl-C stops generation; /help lists commands.\r\n" not in payload
+                or b"^C" not in payload
+                or any(
+                    payload.count(line) != 4
+                    for line in (
+                        b"commands:\r\n",
+                        b"/events - toggle structured event display\r\n",
+                        b"/help - show this help\r\n",
+                        b"/new - clear the session and scrollback\r\n",
+                        b"/status - show runtime statistics\r\n",
+                        b"Ctrl-C - stop generation\r\n",
+                        b"Page Up/Page Down - scroll output\r\n",
+                    )
                 )
-                != 5
             ):
                 raise ValueError("toggle status/history contract")
             interrupted = [
@@ -928,7 +1227,7 @@ def main() -> int:
                 for record in matching_records(
                     records,
                     "GENERATION_COMPLETE",
-                    prompt_index=11,
+                    prompt_index=12,
                 )
             ]
             if (
@@ -944,11 +1243,14 @@ def main() -> int:
                 for start, end in ignored_serial_ranges
             ],
             "logical_events": names,
+            "live_scroll_serial": live_scroll_serial_evidence,
             "model_ready_seconds": model_ready_seconds,
             "physical_records": len(physical),
             "token_records": token_count,
             "turns": turn_results,
         }
+        if args.event_toggle_scenario and live_scroll_serial_evidence is None:
+            raise ValueError("live scroll serial evidence missing")
         if args.oracle is not None:
             result["oracle"] = validate_oracle(
                 records,
@@ -982,8 +1284,11 @@ def main() -> int:
         "artifact_class": "production",
         "build_id": manifest["build_id"],
         "esp_sha256": hashlib.sha256(args.esp.read_bytes()).hexdigest(),
+        "force_sse2": args.force_sse2,
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
         "model_sha256": manifest["artifacts"]["model"]["sha256"],
+        "vcpus": args.vcpus,
+        "vcpu_affinity": vcpu_affinity,
         "serial_bytes": len(payload),
         "serial_sha256": hashlib.sha256(payload).hexdigest(),
         "utc_end": datetime.now(timezone.utc).isoformat(),

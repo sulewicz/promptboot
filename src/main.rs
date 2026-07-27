@@ -13,9 +13,14 @@ use promptboot::console_contract::{
 use promptboot::console_history::ConsoleHistory;
 use promptboot::editor::{Editor, Flow, Output};
 use promptboot::model_contract::{record_emission, ModelRecord as Record, MODEL_RECORD_FATAL};
+use promptboot::status_bar::{
+    bounded_status_geometry, is_event_boundary_line, is_serial_evidence_line, loading_line,
+    native_scrolls_for_output, render_status_row, write_content_with_wrap,
+};
 
 mod model_repl;
 mod model_target;
+mod mp_inference;
 
 type EfiStatus = usize;
 type EfiHandle = *mut c_void;
@@ -31,6 +36,8 @@ const BY_PROTOCOL: u32 = 2;
 const ALLOCATE_ANY_PAGES: u32 = 0;
 const EFI_LOADER_DATA: u32 = 2;
 const EFI_CONVENTIONAL_MEMORY: u32 = 7;
+const EVT_TIMER: u32 = 0x8000_0000;
+const TPL_APPLICATION: usize = 4;
 
 const SERIAL_IO_GUID: Guid = Guid::new(
     0xbb25_cf6f,
@@ -76,6 +83,31 @@ unsafe impl Sync for ConsoleHistoryCell {}
 
 static CONSOLE_HISTORY: ConsoleHistoryCell =
     ConsoleHistoryCell(UnsafeCell::new(ConsoleHistory::new()));
+
+#[derive(Clone, Copy)]
+struct StatusConsole {
+    active: bool,
+    columns: usize,
+}
+
+struct StatusConsoleCell(UnsafeCell<StatusConsole>);
+
+// Status and content rendering are serialized on the boot CPU.
+unsafe impl Sync for StatusConsoleCell {}
+
+static STATUS_CONSOLE: StatusConsoleCell = StatusConsoleCell(UnsafeCell::new(StatusConsole {
+    active: false,
+    columns: 0,
+}));
+
+struct StatusRowCell(UnsafeCell<[u16; promptboot::console_history::MAX_COLUMNS - 1]>);
+
+// Status and content rendering are serialized on the boot CPU.
+unsafe impl Sync for StatusRowCell {}
+
+static STATUS_ROW: StatusRowCell = StatusRowCell(UnsafeCell::new(
+    [b' ' as u16; promptboot::console_history::MAX_COLUMNS - 1],
+));
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -130,6 +162,9 @@ type TextQueryMode =
     unsafe extern "efiapi" fn(*mut SimpleTextOutput, usize, *mut usize, *mut usize) -> EfiStatus;
 type TextClearScreen = unsafe extern "efiapi" fn(*mut SimpleTextOutput) -> EfiStatus;
 type TextEnableCursor = unsafe extern "efiapi" fn(*mut SimpleTextOutput, bool) -> EfiStatus;
+type TextSetAttribute = unsafe extern "efiapi" fn(*mut SimpleTextOutput, usize) -> EfiStatus;
+type TextSetCursorPosition =
+    unsafe extern "efiapi" fn(*mut SimpleTextOutput, usize, usize) -> EfiStatus;
 
 #[repr(C)]
 struct SimpleTextOutput {
@@ -177,6 +212,16 @@ struct EfiKeyData {
 type InputReset = unsafe extern "efiapi" fn(*mut SimpleTextInput, bool) -> EfiStatus;
 type ReadKeyStroke = unsafe extern "efiapi" fn(*mut SimpleTextInput, *mut EfiInputKey) -> EfiStatus;
 type WaitForEvent = unsafe extern "efiapi" fn(usize, *const EfiEvent, *mut usize) -> EfiStatus;
+type CreateEvent = unsafe extern "efiapi" fn(
+    u32,
+    usize,
+    *const c_void,
+    *const c_void,
+    *mut EfiEvent,
+) -> EfiStatus;
+type SetTimer = unsafe extern "efiapi" fn(EfiEvent, u32, u64) -> EfiStatus;
+type CloseEvent = unsafe extern "efiapi" fn(EfiEvent) -> EfiStatus;
+type CheckEvent = unsafe extern "efiapi" fn(EfiEvent) -> EfiStatus;
 
 #[repr(C)]
 struct SimpleTextInput {
@@ -239,12 +284,12 @@ struct BootServices {
     get_memory_map: GetMemoryMap,
     allocate_pool: usize,
     free_pool: FreePool,
-    create_event: usize,
-    set_timer: usize,
+    create_event: CreateEvent,
+    set_timer: SetTimer,
     wait_for_event: usize,
     signal_event: usize,
-    close_event: usize,
-    check_event: usize,
+    close_event: CloseEvent,
+    check_event: CheckEvent,
     install_protocol_interface: usize,
     reinstall_protocol_interface: usize,
     uninstall_protocol_interface: usize,
@@ -409,9 +454,10 @@ extern "efiapi" fn efi_main(image_handle: EfiHandle, system_table: *mut SystemTa
         if let Err(error) = clear_result(((*conout).clear_screen)(conout)) {
             fatal(error.code());
         }
-        if initialize_console_history(conout).is_err() {
-            fatal(b"CONSOLE_MODE");
-        }
+        let (physical_columns, physical_rows) = match initialize_console_history(conout) {
+            Ok(geometry) => geometry,
+            Err(_) => fatal(b"CONSOLE_MODE"),
+        };
 
         if ((*boot).set_watchdog_timer)(0, 0, 0, null()) != EFI_SUCCESS {
             fatal(b"WATCHDOG_DISABLE");
@@ -465,8 +511,19 @@ extern "efiapi" fn efi_main(image_handle: EfiHandle, system_table: *mut SystemTa
             fatal(b"EVIDENCE_RECORD");
         }
         if COMPILE_MODE != "echo_repl" {
-            let status =
-                model_target::run(image_handle, system_table, boot, COMPILE_MODE, BUILD_ID);
+            if COMPILE_MODE == "model_repl" {
+                if let Err(code) = initialize_model_status(physical_columns, physical_rows) {
+                    fatal(code);
+                }
+            }
+            let status = model_target::run(
+                image_handle,
+                system_table,
+                boot,
+                COMPILE_MODE,
+                BUILD_ID,
+                conventional_bytes,
+            );
             if status != EFI_SUCCESS {
                 halt_forever();
             }
@@ -689,8 +746,14 @@ unsafe fn measure_conventional_memory(boot: *mut BootServices) -> Option<u64> {
         }
         offset += descriptor_size;
     }
-    let _ = ((*boot).free_pages)(address, pages);
-    Some(conventional_pages.saturating_mul(4096))
+    if ((*boot).free_pages)(address, pages) != EFI_SUCCESS {
+        return None;
+    }
+    Some(
+        conventional_pages
+            .saturating_add(pages as u64)
+            .saturating_mul(4096),
+    )
 }
 
 unsafe fn has_load_option(
@@ -786,7 +849,8 @@ unsafe fn emit_record(bytes: &[u8]) -> bool {
         return false;
     }
     let conout = CONOUT_SINK.load(Ordering::Acquire);
-    if EVENT_DISPLAY_ENABLED.load(Ordering::Acquire) {
+    let display_enabled = EVENT_DISPLAY_ENABLED.load(Ordering::Acquire);
+    if display_enabled {
         if conout.is_null() {
             RECORD_FAILED.store(true, Ordering::Release);
             return false;
@@ -813,6 +877,16 @@ unsafe fn emit_record(bytes: &[u8]) -> bool {
         if status != EFI_SUCCESS || length != bytes.len() {
             RECORD_FAILED.store(true, Ordering::Release);
             return false;
+        }
+        if display_enabled {
+            // Display writes break their serial prefix deliberately, so the evidence
+            // pair is emitted explicitly and remains adjacent.
+            length = bytes.len();
+            let status = ((*serial).write)(serial, &mut length, bytes.as_ptr().cast());
+            if status != EFI_SUCCESS || length != bytes.len() {
+                RECORD_FAILED.store(true, Ordering::Release);
+                return false;
+            }
         }
     }
     if fallback_fatal {
@@ -864,8 +938,41 @@ unsafe fn emit_record_checked(bytes: &[u8]) -> Result<(), EfiStatus> {
                 status
             });
         }
+        if display_enabled {
+            // Display writes break their serial prefix deliberately, so the evidence
+            // pair is emitted explicitly and remains adjacent.
+            length = bytes.len();
+            let status = ((*serial).write)(serial, &mut length, bytes.as_ptr().cast());
+            if status != EFI_SUCCESS || length != bytes.len() {
+                RECORD_FAILED.store(true, Ordering::Release);
+                return Err(if status == EFI_SUCCESS {
+                    EFI_DEVICE_ERROR
+                } else {
+                    status
+                });
+            }
+        }
     }
     Ok(())
+}
+
+unsafe fn write_serial_checked(bytes: &[u8]) -> Result<(), EfiStatus> {
+    let serial = SERIAL_SINK.load(Ordering::Acquire);
+    if serial.is_null() {
+        return Ok(());
+    }
+    let mut length = bytes.len();
+    restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+    let status = ((*serial).write)(serial, &mut length, bytes.as_ptr().cast());
+    if status != EFI_SUCCESS || length != bytes.len() {
+        Err(if status == EFI_SUCCESS {
+            EFI_DEVICE_ERROR
+        } else {
+            status
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn toggle_event_display() -> bool {
@@ -874,7 +981,9 @@ fn toggle_event_display() -> bool {
     enabled
 }
 
-unsafe fn initialize_console_history(conout: *mut SimpleTextOutput) -> Result<(), EfiStatus> {
+unsafe fn initialize_console_history(
+    conout: *mut SimpleTextOutput,
+) -> Result<(usize, usize), EfiStatus> {
     if (*conout).mode.is_null() || (*(*conout).mode).mode < 0 {
         return Err(EFI_DEVICE_ERROR);
     }
@@ -894,7 +1003,118 @@ unsafe fn initialize_console_history(conout: *mut SimpleTextOutput) -> Result<()
         });
     }
     (*CONSOLE_HISTORY.0.get()).configure(columns, rows);
-    enable_console_cursor()
+    enable_console_cursor()?;
+    Ok((columns, rows))
+}
+
+unsafe fn initialize_model_status(
+    physical_columns: usize,
+    physical_rows: usize,
+) -> Result<(), &'static [u8]> {
+    let conout = CONOUT_SINK.load(Ordering::Acquire);
+    if conout.is_null()
+        || (*conout).set_attribute == 0
+        || (*conout).set_cursor_position == 0
+    {
+        return Err(b"STATUS_BINDING");
+    }
+    let (columns, rows) = bounded_status_geometry(physical_columns, physical_rows)
+        .ok_or(b"STATUS_GEOMETRY" as &'static [u8])?;
+    restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+    if ((*conout).clear_screen)(conout) != EFI_SUCCESS {
+        return Err(b"STATUS_RENDER");
+    }
+    (*CONSOLE_HISTORY.0.get()).configure(columns - 1, rows - 1);
+    *STATUS_CONSOLE.0.get() = StatusConsole {
+        active: true,
+        columns,
+    };
+    let mut line = [0u8; promptboot::console_history::MAX_COLUMNS - 1];
+    let length = loading_line(0, &mut line[..columns - 1]);
+    render_status_ascii(&line[..length]).map_err(|_| b"STATUS_RENDER" as &'static [u8])?;
+    set_console_cursor(0, 1).map_err(|_| b"STATUS_RENDER" as &'static [u8])
+}
+
+unsafe fn render_status_ascii(bytes: &[u8]) -> Result<(), EfiStatus> {
+    let status_console = &*STATUS_CONSOLE.0.get();
+    if !status_console.active {
+        return Err(EFI_DEVICE_ERROR);
+    }
+    let safe_cells = status_console.columns - 1;
+    let rendered = &mut *STATUS_ROW.0.get();
+    rendered.fill(b' ' as u16);
+    for (at, byte) in bytes.iter().copied().take(safe_cells).enumerate() {
+        rendered[at] = if byte.is_ascii() {
+            byte as u16
+        } else {
+            b'?' as u16
+        };
+    }
+    paint_status_row(&rendered[..safe_cells])
+}
+
+unsafe fn restore_status_row() -> Result<(), EfiStatus> {
+    let status_console = &*STATUS_CONSOLE.0.get();
+    if !status_console.active {
+        return Err(EFI_DEVICE_ERROR);
+    }
+    let safe_cells = status_console.columns - 1;
+    let rendered = &*STATUS_ROW.0.get();
+    paint_status_row(&rendered[..safe_cells])
+}
+
+unsafe fn paint_status_row(units: &[u16]) -> Result<(), EfiStatus> {
+    let conout = CONOUT_SINK.load(Ordering::Acquire);
+    if conout.is_null()
+        || (*conout).mode.is_null()
+        || (*conout).set_attribute == 0
+        || (*conout).set_cursor_position == 0
+    {
+        return Err(EFI_DEVICE_ERROR);
+    }
+    let mode = &*(*conout).mode;
+    if mode.cursor_column < 0 || mode.cursor_row < 0 || mode.attribute < 0 {
+        return Err(EFI_DEVICE_ERROR);
+    }
+    let old_attribute = mode.attribute as usize;
+    let old_column = mode.cursor_column as usize;
+    let old_row = mode.cursor_row as usize;
+    let set_attribute: TextSetAttribute = core::mem::transmute((*conout).set_attribute);
+    let set_cursor: TextSetCursorPosition = core::mem::transmute((*conout).set_cursor_position);
+    render_status_row(
+        old_attribute,
+        old_column,
+        old_row,
+        0,
+        units,
+        |column, row| {
+            restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+            set_cursor(conout, column, row)
+        },
+        |attribute| {
+            restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+            set_attribute(conout, attribute)
+        },
+        |units| match raw_conout_utf16(units) {
+            Ok(()) => EFI_SUCCESS,
+            Err(status) => status,
+        },
+    )
+}
+
+unsafe fn set_console_cursor(column: usize, row: usize) -> Result<(), EfiStatus> {
+    let conout = CONOUT_SINK.load(Ordering::Acquire);
+    if conout.is_null() || (*conout).set_cursor_position == 0 {
+        return Err(EFI_DEVICE_ERROR);
+    }
+    let set_cursor: TextSetCursorPosition = core::mem::transmute((*conout).set_cursor_position);
+    restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+    let status = set_cursor(conout, column, row);
+    if status == EFI_SUCCESS {
+        Ok(())
+    } else {
+        Err(status)
+    }
 }
 
 unsafe fn enable_console_cursor() -> Result<(), EfiStatus> {
@@ -933,26 +1153,68 @@ unsafe fn raw_conout_utf16(units: &[u16]) -> Result<(), EfiStatus> {
     Ok(())
 }
 
+unsafe fn raw_content_utf16(
+    units: &[u16],
+    column: usize,
+    width: usize,
+) -> Result<usize, EfiStatus> {
+    write_content_with_wrap(units, column, width, |rendered| {
+        match raw_conout_utf16(rendered) {
+            Ok(()) => EFI_SUCCESS,
+            Err(status) => status,
+        }
+    })
+}
+
 unsafe fn redraw_console_history() -> Result<(), EfiStatus> {
     let conout = CONOUT_SINK.load(Ordering::Acquire);
     if conout.is_null() {
         return Err(EFI_DEVICE_ERROR);
     }
+    let history = &*CONSOLE_HISTORY.0.get();
+    let status_console = *STATUS_CONSOLE.0.get();
+    if !status_console.active {
+        restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
+        let status = ((*conout).clear_screen)(conout);
+        if status != EFI_SUCCESS {
+            return Err(status);
+        }
+        let lines = history.viewport_len();
+        for row in 0..lines {
+            let (line, hard_break) = history.viewport_line(row);
+            raw_conout_utf16(line)?;
+            if hard_break && row + 1 < lines {
+                raw_conout_utf16(&[0x000d, 0x000a])?;
+            }
+        }
+        return Ok(());
+    }
+
     restore_fp_state(core::ptr::addr_of!(SAVED_FP_STATE));
     let status = ((*conout).clear_screen)(conout);
     if status != EFI_SUCCESS {
         return Err(status);
     }
-    let history = &*CONSOLE_HISTORY.0.get();
     let lines = history.viewport_len();
     for row in 0..lines {
-        let (line, hard_break) = history.viewport_line(row);
-        raw_conout_utf16(line)?;
-        if hard_break && row + 1 < lines {
-            raw_conout_utf16(&[0x000d, 0x000a])?;
+        let (line, _) = history.viewport_line(row);
+        if line.is_empty() {
+            continue;
+        }
+        set_console_cursor(0, row + 1)?;
+        // A cursor operation inside a redrawn record keeps firmware serial
+        // mirroring from presenting the redraw as a second structured record.
+        if is_serial_evidence_line(line) {
+            raw_conout_utf16(&line[..1])?;
+            set_console_cursor(1, row + 1)?;
+            raw_conout_utf16(&line[1..])?;
+        } else {
+            raw_conout_utf16(line)?;
         }
     }
-    Ok(())
+    let (column, row) = history.viewport_cursor();
+    set_console_cursor(column, row + 1)?;
+    restore_status_row()
 }
 
 unsafe fn console_output_utf16(units: &[u16]) -> Result<(), EfiStatus> {
@@ -960,8 +1222,40 @@ unsafe fn console_output_utf16(units: &[u16]) -> Result<(), EfiStatus> {
     if returned {
         redraw_console_history()?;
     }
-    (*CONSOLE_HISTORY.0.get()).write(units);
-    raw_conout_utf16(units)
+    let history = &mut *CONSOLE_HISTORY.0.get();
+    let active = (*STATUS_CONSOLE.0.get()).active;
+    if !active {
+        history.write(units);
+        return raw_conout_utf16(units);
+    }
+    let (column, row) = history.viewport_cursor();
+    let scrolls = native_scrolls_for_output(
+        units,
+        column,
+        row,
+        history.width(),
+        history.rows(),
+    )
+    .ok_or(EFI_DEVICE_ERROR)?;
+    history.write(units);
+    set_console_cursor(column, row + 1)?;
+    if is_event_boundary_line(units) || is_serial_evidence_line(units) {
+        let next_column = raw_content_utf16(&units[..1], column, history.width())?;
+        let conout = CONOUT_SINK.load(Ordering::Acquire);
+        let mode = &*(*conout).mode;
+        if mode.cursor_column < 0 || mode.cursor_row < 0 {
+            return Err(EFI_DEVICE_ERROR);
+        }
+        set_console_cursor(mode.cursor_column as usize, mode.cursor_row as usize)?;
+        raw_content_utf16(&units[1..], next_column, history.width())?;
+    } else {
+        raw_content_utf16(units, column, history.width())?;
+    }
+    if scrolls == 0 {
+        Ok(())
+    } else {
+        restore_status_row()
+    }
 }
 
 unsafe fn scroll_console_page(up: bool) -> Result<(), EfiStatus> {
@@ -978,6 +1272,10 @@ unsafe fn scroll_console_page(up: bool) -> Result<(), EfiStatus> {
 
 unsafe fn reset_console_history() -> Result<(), EfiStatus> {
     (*CONSOLE_HISTORY.0.get()).reset();
+    if (*STATUS_CONSOLE.0.get()).active {
+        redraw_console_history()?;
+        return enable_console_cursor();
+    }
     let conout = CONOUT_SINK.load(Ordering::Acquire);
     if conout.is_null() {
         return Err(EFI_DEVICE_ERROR);

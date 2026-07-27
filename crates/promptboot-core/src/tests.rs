@@ -2,6 +2,11 @@ extern crate std;
 
 use core::mem::{align_of, offset_of, size_of};
 use core::ptr;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::hint::black_box;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 use std::vec;
 use std::vec::Vec;
 use std::{env, fs};
@@ -15,6 +20,57 @@ const EXP_EDGE: &[u8; 128] = include_bytes!("../../../fixtures/analytic/expf-edg
 #[repr(align(64))]
 struct Aligned<const N: usize>([u8; N]);
 
+struct ScopedDispatcher {
+    calls: Arc<AtomicUsize>,
+    failure: Arc<AtomicU32>,
+    workers: u32,
+    backend: u32,
+}
+
+unsafe extern "efiapi" fn dispatch_scoped_workers(
+    context: *mut core::ffi::c_void,
+    job: *mut InferenceWorkerJob,
+) {
+    let dispatcher = &mut *context.cast::<ScopedDispatcher>();
+    dispatcher.calls.fetch_add(1, Ordering::Relaxed);
+    let workers = dispatcher.workers;
+    let backend = dispatcher.backend;
+    let failure = Arc::clone(&dispatcher.failure);
+    let job_address = job as usize;
+    thread::scope(|scope| {
+        for slot in 1..workers {
+            let failure = Arc::clone(&failure);
+            scope.spawn(move || {
+                let status = unsafe {
+                    inference_worker_entry(job_address as *mut _, slot, workers, backend)
+                };
+                if status != 0 {
+                    let _ =
+                        failure.compare_exchange(0, status, Ordering::AcqRel, Ordering::Acquire);
+                }
+            });
+        }
+        let status = unsafe { inference_worker_entry(job, 0, workers, backend) };
+        if status != 0 {
+            let _ = failure.compare_exchange(0, status, Ordering::AcqRel, Ordering::Acquire);
+        }
+    });
+}
+
+fn test_dispatcher(
+    calls: Arc<AtomicUsize>,
+    failure: Arc<AtomicU32>,
+    workers: u32,
+    backend: u32,
+) -> ScopedDispatcher {
+    ScopedDispatcher {
+        calls,
+        failure,
+        workers,
+        backend,
+    }
+}
+
 fn words(values: &[f32]) -> Vec<u8> {
     values
         .iter()
@@ -24,6 +80,38 @@ fn words(values: &[f32]) -> Vec<u8> {
 
 fn word_bytes(values: &[u32]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) }
+}
+
+fn duration_median(mut values: Vec<Duration>) -> Duration {
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+fn used_kv_words(kv: &[u8], position: usize, config: ModelConfig) -> Vec<u32> {
+    let words = position
+        * config.block_count as usize
+        * 2
+        * config.kv_heads as usize
+        * config.head_dim as usize;
+    let mut result = Vec::with_capacity(words);
+    for layer in 0..config.block_count as usize {
+        for kind in 0..2 {
+            for at in 0..position {
+                for head in 0..config.kv_heads as usize {
+                    for component in 0..config.head_dim as usize {
+                        let index = crate::inference::kv_word(layer, kind, at, head, component);
+                        let offset = index * core::mem::size_of::<u32>();
+                        result.push(u32::from_ne_bytes(
+                            kv[offset..offset + core::mem::size_of::<u32>()]
+                                .try_into()
+                                .unwrap(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    result
 }
 
 fn hex(value: &str) -> Vec<u8> {
@@ -522,6 +610,276 @@ fn inference_probability_transfer_replaces_all_sentinel_bytes() {
 }
 
 #[test]
+fn tiled_kv_layout_is_exact_nonoverlapping_and_bounded() {
+    const POSITIONS: [usize; 10] = [0, 1, 3, 4, 5, 255, 256, 511, 512, 32_767];
+    const CONTEXT: usize = CONTEXT_LIMIT as usize;
+    const HEADS: usize = 2;
+    const DIMENSION: usize = 64;
+    const TILES: usize = CONTEXT / 4;
+    const LAYER_WORDS: usize = 2 * HEADS * CONTEXT * DIMENSION;
+
+    assert_eq!(crate::inference::KV_LAYER_WORDS, LAYER_WORDS);
+    assert_eq!(crate::inference::LAYERS * LAYER_WORDS * 4, KV_BYTES);
+    assert_eq!(KV_BYTES & 63, 0);
+    assert_eq!(LAYER_WORDS * 4 & 63, 0);
+
+    let expected = |layer: usize, kind: usize, position: usize, head: usize, component: usize| {
+        let base = layer * LAYER_WORDS;
+        if kind == 0 {
+            base + (((head * TILES + position / 4) * DIMENSION + component) * 4 + position % 4)
+        } else {
+            base + HEADS * CONTEXT * DIMENSION
+                + ((head * CONTEXT + position) * DIMENSION + component)
+        }
+    };
+
+    let mut addresses = Vec::new();
+    for layer in [0, crate::inference::LAYERS - 1] {
+        for kind in 0..2 {
+            for position in POSITIONS {
+                for head in 0..HEADS {
+                    let mut component_addresses = Vec::with_capacity(DIMENSION);
+                    for component in 0..DIMENSION {
+                        let address =
+                            crate::inference::kv_word(layer, kind, position, head, component);
+                        assert_eq!(address, expected(layer, kind, position, head, component));
+                        assert!(address < KV_BYTES / 4);
+                        addresses.push(address);
+                        component_addresses.push(address);
+                    }
+                    let first = *component_addresses.iter().min().unwrap();
+                    let last = *component_addresses.iter().max().unwrap();
+                    let mut canary = vec![0xa5a5_a5a5u32; last - first + 3];
+                    for address in component_addresses {
+                        canary[address - first + 1] = address as u32;
+                    }
+                    assert_eq!(canary[0], 0xa5a5_a5a5);
+                    assert_eq!(*canary.last().unwrap(), 0xa5a5_a5a5);
+                }
+            }
+        }
+    }
+    addresses.sort_unstable();
+    let sampled = addresses.len();
+    addresses.dedup();
+    assert_eq!(addresses.len(), sampled);
+    assert_eq!(
+        crate::inference::kv_word(
+            crate::inference::LAYERS - 1,
+            1,
+            CONTEXT - 1,
+            HEADS - 1,
+            DIMENSION - 1,
+        ),
+        KV_BYTES / 4 - 1
+    );
+}
+
+#[test]
+#[ignore = "host AVX2 performance gate; run pinned on one CPU"]
+fn tiled_kv_attention_backends_are_exact_and_faster() {
+    const HEADS: usize = 2;
+    const CONTEXT: usize = CONTEXT_LIMIT as usize;
+    const DIMENSION: usize = 64;
+    const HEAD_WORDS: usize = CONTEXT * DIMENSION;
+    const LAYER_WORDS: usize = HEADS * HEAD_WORDS * 2;
+
+    assert!(inference_avx2_available());
+    let value_bits = |index: usize| {
+        let mixed = (index as u32)
+            .wrapping_mul(0x9e37_79b9)
+            .rotate_left((index & 31) as u32);
+        let signed = (mixed & 0x1fff) as i32 - 0x1000;
+        ((signed as f32) / 4096.0).to_bits()
+    };
+    let mut query = vec![0u32; 14 * DIMENSION];
+    for (index, value) in query.iter_mut().enumerate() {
+        *value = value_bits(index + 1);
+    }
+    query[..6].copy_from_slice(&[
+        0x0000_0000,
+        0x8000_0000,
+        0x0000_0001,
+        0x007f_ffff,
+        0x0080_0000,
+        0x8000_0001,
+    ]);
+    let mut tiled_kv = vec![0u32; LAYER_WORDS];
+    for kind in 0..2 {
+        for head in 0..HEADS {
+            for position in 0..CONTEXT {
+                for component in 0..DIMENSION {
+                    let logical =
+                        (((kind * HEADS + head) * CONTEXT + position) * DIMENSION) + component;
+                    let bits = value_bits(logical + query.len());
+                    let tiled = crate::inference::kv_word(0, kind, position, head, component);
+                    tiled_kv[tiled] = bits;
+                }
+            }
+        }
+    }
+    for (component, bits) in query[..6].iter().copied().enumerate() {
+        tiled_kv[crate::inference::kv_word(0, 0, 0, 0, component)] = bits;
+        tiled_kv[crate::inference::kv_word(0, 1, 0, 1, component)] = bits;
+    }
+
+    let previous_mxcsr = unsafe { crate::fp32_sse2::inference_enter_fp() };
+    for positions in [
+        1usize, 2, 3, 4, 5, 6, 30, 255, 256, 257, 511, 512, 513, 2_048, 8_192, 32_768,
+    ] {
+        let span = (positions + 3) & !3;
+        let mut scalar_output = vec![0u32; 14 * DIMENSION];
+        let mut candidate_output = vec![0u32; 14 * DIMENSION];
+        let mut scalar_scores = vec![0u32; span];
+        let mut candidate_scores = vec![0u32; span];
+        let mut scalar_raw = vec![0u32; 14 * span];
+        let mut candidate_raw = vec![0u32; 14 * span];
+        let mut scalar_probabilities = vec![0u32; 14 * span];
+        let mut candidate_probabilities = vec![0u32; 14 * span];
+        let checks_masked_tail = matches!(positions, 1 | 2 | 3 | 5 | 30);
+        if checks_masked_tail {
+            unsafe { crate::fp32_sse2::inference_clear_fp_exceptions_for_test() };
+        }
+        unsafe {
+            crate::fp32_sse2::inference_attention_captured_for_test(
+                crate::fp32_sse2::InferenceBackend::Sse2,
+                query.as_ptr().cast(),
+                tiled_kv.as_ptr().cast(),
+                scalar_output.as_mut_ptr().cast(),
+                scalar_scores.as_mut_ptr().cast(),
+                0,
+                positions - 1,
+                span,
+                scalar_raw.as_mut_ptr(),
+                scalar_probabilities.as_mut_ptr(),
+            );
+        }
+        if checks_masked_tail {
+            let exceptions = unsafe { crate::fp32_sse2::inference_fp_exceptions_for_test() };
+            assert_eq!(
+                exceptions & 1,
+                0,
+                "N={positions} scalar attention raised invalid"
+            );
+        }
+        let mut disabled_keys = Vec::new();
+        if checks_masked_tail {
+            for head in 0..HEADS {
+                for position in positions..span {
+                    for component in 0..DIMENSION {
+                        let word = crate::inference::kv_word(0, 0, position, head, component);
+                        disabled_keys.push((word, tiled_kv[word]));
+                        tiled_kv[word] = 0x7f80_0001;
+                    }
+                }
+            }
+            unsafe { crate::fp32_sse2::inference_clear_fp_exceptions_for_test() };
+        }
+        unsafe {
+            crate::fp32_sse2::inference_attention_captured_for_test(
+                crate::fp32_sse2::InferenceBackend::Avx2,
+                query.as_ptr().cast(),
+                tiled_kv.as_ptr().cast(),
+                candidate_output.as_mut_ptr().cast(),
+                candidate_scores.as_mut_ptr().cast(),
+                0,
+                positions - 1,
+                span,
+                candidate_raw.as_mut_ptr(),
+                candidate_probabilities.as_mut_ptr(),
+            );
+        }
+        if !disabled_keys.is_empty() {
+            let exceptions = unsafe { crate::fp32_sse2::inference_fp_exceptions_for_test() };
+            for (word, bits) in disabled_keys {
+                tiled_kv[word] = bits;
+            }
+            assert_eq!(
+                exceptions & 1,
+                0,
+                "N={positions} accessed a disabled signaling-NaN K lane"
+            );
+        }
+        assert_eq!(candidate_raw, scalar_raw, "N={positions} raw scores");
+        assert_eq!(
+            candidate_probabilities, scalar_probabilities,
+            "N={positions} probabilities"
+        );
+        assert_eq!(candidate_output, scalar_output, "N={positions} output");
+
+        let repetitions = match positions {
+            1 | 30 | 256 | 512 => 100,
+            2_048 | 8_192 => 30,
+            _ => continue,
+        };
+        let mut scalar_times = Vec::with_capacity(repetitions);
+        let mut candidate_times = Vec::with_capacity(repetitions);
+        for _ in 0..repetitions {
+            let started = Instant::now();
+            unsafe {
+                crate::fp32_sse2::inference_attention(
+                    crate::fp32_sse2::InferenceBackend::Sse2,
+                    query.as_ptr().cast(),
+                    tiled_kv.as_ptr().cast(),
+                    scalar_output.as_mut_ptr().cast(),
+                    scalar_scores.as_mut_ptr().cast(),
+                    0,
+                    positions - 1,
+                    span,
+                );
+            }
+            scalar_times.push(started.elapsed());
+            black_box(&scalar_output);
+        }
+        for _ in 0..repetitions {
+            let started = Instant::now();
+            unsafe {
+                crate::fp32_sse2::inference_attention(
+                    crate::fp32_sse2::InferenceBackend::Avx2,
+                    query.as_ptr().cast(),
+                    tiled_kv.as_ptr().cast(),
+                    candidate_output.as_mut_ptr().cast(),
+                    candidate_scores.as_mut_ptr().cast(),
+                    0,
+                    positions - 1,
+                    span,
+                );
+            }
+            candidate_times.push(started.elapsed());
+            black_box(&candidate_output);
+        }
+        let scalar_median = duration_median(scalar_times.clone());
+        let candidate_median = duration_median(candidate_times);
+        let scalar_min = *scalar_times.iter().min().unwrap();
+        let scalar_max = *scalar_times.iter().max().unwrap();
+        let scalar_range = scalar_max - scalar_min;
+        let reduction = scalar_median.saturating_sub(candidate_median);
+        let speedup = scalar_median.as_secs_f64() / candidate_median.as_secs_f64();
+        std::println!(
+            "TILED_KV_ATTENTION N={positions} reps={repetitions} scalar_median={:.9} candidate_median={:.9} scalar_range={:.9} reduction={:.9} speedup={speedup:.6}",
+            scalar_median.as_secs_f64(),
+            candidate_median.as_secs_f64(),
+            scalar_range.as_secs_f64(),
+            reduction.as_secs_f64(),
+        );
+        if positions == 30 {
+            assert!(
+                candidate_median <= scalar_median + scalar_range,
+                "N=30 regressed beyond scalar range"
+            );
+        }
+        if matches!(positions, 512 | 2_048 | 8_192) {
+            assert!(speedup >= 2.0, "N={positions} speedup below 2x");
+            assert!(
+                reduction > scalar_range,
+                "N={positions} reduction did not exceed scalar range"
+            );
+        }
+    }
+    unsafe { crate::fp32_sse2::inference_exit_fp(previous_mxcsr) };
+}
+
+#[test]
 #[ignore = "requires PROMPTBOOT_TEST_MODEL; run make validate-host"]
 fn inference_prechecks_state_usage_and_faults_are_exact() {
     let path =
@@ -569,6 +927,7 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
         &model,
         &mut kv_storage[kv_start..kv_start + KV_BYTES - 1],
         &mut scratch_storage[scratch_start..scratch_start + SCRATCH_BYTES],
+        None,
     )
     .err()
     .expect("short KV must fail");
@@ -589,6 +948,7 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
         &model,
         &mut kv_storage[kv_start..kv_start + KV_BYTES],
         &mut scratch_storage[scratch_start + 1..scratch_start + 1 + SCRATCH_BYTES],
+        None,
     )
     .err()
     .expect("misaligned scratch must fail");
@@ -600,6 +960,7 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
         &model,
         &mut kv_storage[kv_start..kv_start + KV_BYTES],
         &mut scratch_storage[scratch_start..scratch_start + SCRATCH_BYTES - 1],
+        None,
     )
     .err()
     .expect("short scratch must fail");
@@ -620,6 +981,7 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
         &model,
         &mut kv_storage[kv_start + 1..kv_start + 1 + KV_BYTES],
         &mut scratch_storage[scratch_start..scratch_start + SCRATCH_BYTES],
+        None,
     )
     .err()
     .expect("misaligned KV must fail");
@@ -662,6 +1024,7 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
             &model,
             &mut kv_storage[kv_start..kv_start + KV_BYTES],
             &mut scratch_storage[scratch_start..scratch_start + SCRATCH_BYTES],
+            None,
         )
         .err()
         .unwrap_or_else(|| panic!("injected {name} mismatch must fail"));
@@ -681,8 +1044,19 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
         &model,
         &mut kv_storage[kv_start..kv_start + KV_BYTES],
         &mut scratch_storage[scratch_start..scratch_start + SCRATCH_BYTES],
+        None,
     )
     .unwrap();
+    let source = [0x3f80_0000u32; 128];
+    let before_invalid_write = engine.arena_digests_for_test();
+    assert!(engine
+        .write_kv_for_test(crate::inference::LAYERS, 0, &source, &source)
+        .is_err());
+    assert!(engine
+        .write_kv_for_test(0, CONTEXT_LIMIT as usize, &source, &source)
+        .is_err());
+    assert_eq!(engine.arena_digests_for_test(), before_invalid_write);
+    assert!(canaries_intact());
     macro_rules! precheck_error {
         ($buffer:ident, $call:expr) => {{
             let before_logits = crate::sha256::digest(word_bytes(&$buffer));
@@ -826,7 +1200,7 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
         ]
     );
     assert!(long_logits.iter().all(|word| *word == 0xfeed_face));
-    assert!(engine.kv_is_zero_for_test());
+    assert!(engine.kv_is_filled_for_test(0xa5));
     assert!(engine.scratch_is_zero_for_test());
     let before = precheck_error!(logits, engine.decode(0, &mut logits));
     assert_eq!(
@@ -988,10 +1362,7 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
         assert!(logits.iter().all(|word| *word == 0), "{name} logits");
         assert!(engine.scratch_is_zero_for_test(), "{name} scratch");
         if domain == InferenceDomain::KV {
-            assert!(
-                engine.kv_is_zero_for_test(),
-                "invalid KV must never be published"
-            );
+            assert!(engine.kv_is_filled_for_test(0xa5), "invalid KV published");
         }
         if name == "embedding" {
             let state_error = precheck_error!(logits, engine.prefill(&[0], 1, &mut logits));
@@ -1014,7 +1385,6 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
             fault_usage.scratch.high_water
         );
         assert_eq!(reset_usage.kv.high_water, fault_usage.kv.high_water);
-        assert!(engine.kv_is_zero_for_test(), "{name} reset KV");
         assert!(engine.scratch_is_zero_for_test(), "{name} reset scratch");
         assert!(canaries_intact(), "{name} canaries");
     }
@@ -1099,11 +1469,58 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
             fault_usage.scratch.high_water
         );
         assert_eq!(reset_usage.kv.high_water, fault_usage.kv.high_water);
-        assert!(engine.kv_is_zero_for_test(), "{name} reset KV");
         assert!(engine.scratch_is_zero_for_test(), "{name} reset scratch");
         assert!(canaries_intact(), "{name} canaries");
     }
     assert_eq!(engine.usage().state, InferenceState::RESET as u32);
+
+    let kv_words = |engine: &InferenceEngine<'_, '_, '_, '_>, kind: usize, position: usize| {
+        let mut words = Vec::with_capacity(128);
+        for head in 0..2 {
+            for component in 0..64 {
+                words.push(engine.logical_kv_word_for_test(0, kind, position, head, component));
+            }
+        }
+        words
+    };
+    logits.fill(0xfeed_face);
+    engine
+        .prefill_with_prefix(&[0, 1], 1, 32, &mut logits)
+        .unwrap();
+    assert_eq!(engine.reset_to_prefix().unwrap(), 1);
+    let key_before = kv_words(&engine, 0, 1);
+    let value_before = kv_words(&engine, 1, 1);
+    crate::inference::set_kv_write_fault_for_test(0);
+    let key_fault = engine
+        .prefill_with_prefix(&[0, 2], 1, 32, &mut logits)
+        .unwrap_err();
+    assert_eq!(key_fault.domain, InferenceDomain::KV as u32);
+    assert_eq!(key_fault.position, 1);
+    assert_ne!(kv_words(&engine, 0, 1), key_before);
+    assert_eq!(kv_words(&engine, 1, 1), value_before);
+    assert_eq!(engine.usage().state, InferenceState::FAULTED as u32);
+    assert_eq!(engine.retained_prefix_for_test(), None);
+    assert!(logits.iter().all(|word| *word == 0));
+    assert!(engine.scratch_is_zero_for_test());
+    engine.reset().unwrap();
+    assert_eq!(engine.position(), 0);
+
+    let key_before = kv_words(&engine, 0, 0);
+    let value_before = kv_words(&engine, 1, 0);
+    logits.fill(0xfeed_face);
+    crate::inference::set_kv_write_fault_for_test(1);
+    let value_fault = engine.prefill(&[2], 32, &mut logits).unwrap_err();
+    assert_eq!(value_fault.domain, InferenceDomain::KV as u32);
+    assert_eq!(value_fault.position, 0);
+    assert_ne!(kv_words(&engine, 0, 0), key_before);
+    assert_ne!(kv_words(&engine, 1, 0), value_before);
+    assert_eq!(engine.usage().state, InferenceState::FAULTED as u32);
+    assert_eq!(engine.retained_prefix_for_test(), None);
+    assert!(logits.iter().all(|word| *word == 0));
+    assert!(engine.scratch_is_zero_for_test());
+    engine.reset().unwrap();
+    assert_eq!(engine.position(), 0);
+    assert!(canaries_intact());
 
     logits.fill(0xfeed_face);
     let successful = engine.prefill(&[0], 32, &mut logits).unwrap();
@@ -1135,7 +1552,6 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
         ready_reset.scratch.high_water,
         ready_usage.scratch.high_water
     );
-    assert!(engine.kv_is_zero_for_test());
     assert!(engine.scratch_is_zero_for_test());
 
     engine.force_decode_state_for_test(5, 2, 1, 42);
@@ -1226,7 +1642,6 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
         engine.usage().scratch.high_water,
         eos_high_water.scratch.high_water
     );
-    assert!(engine.kv_is_zero_for_test());
     assert!(engine.scratch_is_zero_for_test());
     let reset_high_water = engine.usage();
     engine.reset().unwrap();
@@ -1247,10 +1662,93 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
     assert_eq!(engine.arena_digests_for_test(), full_arenas);
 
     engine.reset().unwrap();
+    let retained = engine
+        .prefill_with_prefix(&[42, 43], 1, 32, &mut logits)
+        .unwrap();
+    assert_eq!(retained, full);
+    assert_eq!(engine.retained_prefix_for_test(), Some(1));
+    assert_eq!(engine.reset_to_prefix().unwrap(), 1);
+    assert_eq!(engine.position(), 1);
+    let reused = engine
+        .prefill_with_prefix(&[42, 43], 1, 32, &mut logits)
+        .unwrap();
+    assert_eq!(reused, full);
+    assert_eq!(crate::sha256::digest(word_bytes(&logits)), full_logits);
+    assert_eq!(engine.arena_digests_for_test(), full_arenas);
+    assert_eq!(engine.reset_to_prefix().unwrap(), 1);
+    assert_eq!(engine.reset_to_prefix().unwrap(), 1);
+
+    let invalid_boundary = engine
+        .prefill_with_prefix(&[42, 43], 0, 32, &mut logits)
+        .unwrap_err();
+    assert_eq!(invalid_boundary.status, InferenceStatus::CONTEXT as u32);
+    assert_eq!(engine.position(), 0);
+    assert_eq!(engine.retained_prefix_for_test(), None);
+
+    crate::inference::set_inference_fault_for_test(
+        InferenceDomain::EMBEDDING,
+        NO_LAYER,
+        0,
+        f32::NAN.to_bits(),
+    );
+    assert!(engine
+        .prefill_with_prefix(&[42, 43], 1, 32, &mut logits)
+        .is_err());
+    assert_eq!(engine.usage().state, InferenceState::FAULTED as u32);
+    assert_eq!(engine.retained_prefix_for_test(), None);
+    assert_eq!(engine.reset_to_prefix().unwrap(), 0);
+    assert_eq!(engine.position(), 0);
+
+    engine
+        .prefill_with_prefix(&[42, 43], 1, 32, &mut logits)
+        .unwrap();
+    let non_reset_mismatch = engine
+        .prefill_with_prefix(&[44, 43], 1, 32, &mut logits)
+        .unwrap_err();
+    assert_eq!(non_reset_mismatch.status, InferenceStatus::STATE as u32);
+    assert_eq!(engine.usage().state, InferenceState::RESET as u32);
+    assert_eq!(engine.position(), 0);
+    assert_eq!(engine.retained_prefix_for_test(), None);
+
+    engine
+        .prefill_with_prefix(&[42, 43], 1, 32, &mut logits)
+        .unwrap();
+    assert_eq!(engine.reset_to_prefix().unwrap(), 1);
+    crate::inference::set_inference_fault_for_test(
+        InferenceDomain::EMBEDDING,
+        NO_LAYER,
+        0,
+        f32::NAN.to_bits(),
+    );
+    assert!(engine
+        .prefill_with_prefix(&[42, 43], 1, 32, &mut logits)
+        .is_err());
+    assert_eq!(engine.usage().state, InferenceState::FAULTED as u32);
+    assert_eq!(engine.retained_prefix_for_test(), None);
+    assert_eq!(engine.reset_to_prefix().unwrap(), 0);
+    assert_eq!(engine.position(), 0);
+
+    let divergent = engine.prefill(&[44, 43], 32, &mut logits).unwrap();
+    let divergent_logits = crate::sha256::digest(word_bytes(&logits));
+    engine.reset().unwrap();
+    engine
+        .prefill_with_prefix(&[42, 43], 1, 32, &mut logits)
+        .unwrap();
+    assert_eq!(engine.reset_to_prefix().unwrap(), 1);
+    let divergent_after_prefix = engine
+        .prefill_with_prefix(&[44, 43], 1, 32, &mut logits)
+        .unwrap();
+    assert_eq!(divergent_after_prefix, divergent);
+    assert_eq!(crate::sha256::digest(word_bytes(&logits)), divergent_logits);
+    assert_eq!(engine.retained_prefix_for_test(), Some(1));
+    engine.force_state_for_test(InferenceState::RESET, 0);
+    assert_eq!(engine.reset_to_prefix().unwrap(), 0);
+    assert_eq!(engine.retained_prefix_for_test(), None);
+
+    engine.reset().unwrap();
+    assert_eq!(engine.kv_byte_for_test(KV_BYTES - 1), 0xa5);
     drop(engine);
-    assert!(kv_storage[kv_start..kv_start + KV_BYTES]
-        .iter()
-        .all(|byte| *byte == 0));
+    assert_eq!(kv_storage[kv_start + KV_BYTES - 1], 0xa5);
     assert!(
         scratch_storage[scratch_start..scratch_start + SCRATCH_BYTES]
             .iter()
@@ -1266,6 +1764,766 @@ fn inference_prechecks_state_usage_and_faults_are_exact() {
     assert!(scratch_storage[scratch_start + SCRATCH_BYTES..]
         .iter()
         .all(|byte| *byte == 0x5a));
+}
+
+#[test]
+#[ignore = "requires PROMPTBOOT_TEST_MODEL; run make validate-host"]
+fn inference_dirty_and_stale_kv_match_fresh_paths() {
+    let path =
+        env::var("PROMPTBOOT_TEST_MODEL").expect("PROMPTBOOT_TEST_MODEL; run make validate-host");
+    let file = fs::read(path).unwrap();
+    let mut model_storage = vec![0u8; file.len() + 63];
+    let model_start = (64 - (model_storage.as_ptr() as usize & 63)) & 63;
+    model_storage[model_start..model_start + file.len()].copy_from_slice(&file);
+    let model =
+        ModelView::open_authenticated(&model_storage[model_start..model_start + file.len()])
+            .unwrap();
+
+    let mut dirty_kv = vec![0xa5u8; KV_BYTES + 63];
+    let dirty_start = (64 - (dirty_kv.as_ptr() as usize & 63)) & 63;
+    let mut fresh_kv = vec![0u8; KV_BYTES + 63];
+    let fresh_start = (64 - (fresh_kv.as_ptr() as usize & 63)) & 63;
+    let mut dirty_scratch = vec![0x5au8; SCRATCH_BYTES + 63];
+    let dirty_scratch_start = (64 - (dirty_scratch.as_ptr() as usize & 63)) & 63;
+    let mut fresh_scratch = vec![0u8; SCRATCH_BYTES + 63];
+    let fresh_scratch_start = (64 - (fresh_scratch.as_ptr() as usize & 63)) & 63;
+    let mut dirty = InferenceEngine::build(
+        &model,
+        &mut dirty_kv[dirty_start..dirty_start + KV_BYTES],
+        &mut dirty_scratch[dirty_scratch_start..dirty_scratch_start + SCRATCH_BYTES],
+        None,
+    )
+    .unwrap();
+    let mut fresh = InferenceEngine::build(
+        &model,
+        &mut fresh_kv[fresh_start..fresh_start + KV_BYTES],
+        &mut fresh_scratch[fresh_scratch_start..fresh_scratch_start + SCRATCH_BYTES],
+        None,
+    )
+    .unwrap();
+    dirty.force_backend_for_test(crate::fp32_sse2::InferenceBackend::Sse2);
+    if crate::fp32_sse2::InferenceBackend::detect() == crate::fp32_sse2::InferenceBackend::Avx2 {
+        fresh.force_backend_for_test(crate::fp32_sse2::InferenceBackend::Avx2);
+        assert_eq!(
+            (dirty.backend_name(), fresh.backend_name()),
+            ("sse2", "avx2")
+        );
+    }
+    assert!(dirty.kv_is_filled_for_test(0xa5));
+    assert!(fresh.kv_is_filled_for_test(0));
+    assert!(dirty.scratch_is_zero_for_test());
+    assert!(fresh.scratch_is_zero_for_test());
+
+    let mut dirty_logits = vec![0u32; LOGIT_WORDS];
+    let mut fresh_logits = vec![0u32; LOGIT_WORDS];
+    dirty.reset_q8_preparations_for_test();
+    dirty.prefill(&[42], 8, &mut dirty_logits).unwrap();
+    let full_logit_preparations = dirty.q8_preparations_for_test();
+    dirty.reset().unwrap();
+    dirty.reset_q8_preparations_for_test();
+    dirty.prefill(&[42, 43], 8, &mut dirty_logits).unwrap();
+    let non_logit_preparations = dirty.q8_preparations_for_test() - full_logit_preparations;
+    assert_eq!((full_logit_preparations, non_logit_preparations), (97, 96));
+    dirty.reset().unwrap();
+
+    dirty.prefill(&[42], 8, &mut dirty_logits).unwrap();
+    fresh.prefill(&[42], 8, &mut fresh_logits).unwrap();
+    assert_eq!(dirty_logits, fresh_logits, "dirty build first prefill");
+    dirty.decode_selected(43, &mut dirty_logits).unwrap();
+    fresh.decode_selected(43, &mut fresh_logits).unwrap();
+    assert_eq!(dirty_logits, fresh_logits, "dirty build decode");
+
+    dirty.reset().unwrap();
+    dirty.reset().unwrap();
+    fresh.reset().unwrap();
+    dirty.prefill(&[42, 43, 44], 8, &mut dirty_logits).unwrap();
+    fresh.prefill(&[42, 43, 44], 8, &mut fresh_logits).unwrap();
+    assert_eq!(
+        dirty_logits, fresh_logits,
+        "multi-token prefill after reset"
+    );
+
+    dirty.reset().unwrap();
+    fresh.reset().unwrap();
+    dirty.prefill(&[42], 8, &mut dirty_logits).unwrap();
+    dirty
+        .append_prefill(&[43, 44], 8, &mut dirty_logits)
+        .unwrap();
+    fresh.prefill(&[42, 43, 44], 8, &mut fresh_logits).unwrap();
+    assert_eq!(dirty_logits, fresh_logits, "cached append versus fresh");
+
+    dirty.reset().unwrap();
+    fresh.reset().unwrap();
+    dirty.prefill(&[1, 2, 3], 8, &mut dirty_logits).unwrap();
+    fresh.prefill(&[4, 5], 8, &mut fresh_logits).unwrap();
+    dirty.reset().unwrap();
+    dirty.reset().unwrap();
+    fresh.reset().unwrap();
+    dirty.prefill(&[42, 43], 8, &mut dirty_logits).unwrap();
+    fresh.prefill(&[42, 43], 8, &mut fresh_logits).unwrap();
+    assert_eq!(
+        dirty_logits, fresh_logits,
+        "divergent stale sessions after reset"
+    );
+    assert_eq!(dirty.kv_byte_for_test(KV_BYTES - 1), 0xa5);
+    assert!(dirty.scratch_is_zero_for_test());
+    assert!(fresh.scratch_is_zero_for_test());
+}
+
+#[test]
+#[ignore = "requires PROMPTBOOT_TEST_MODEL; run make validate-host"]
+fn inference_dispatch_preflight_failures_make_zero_worker_calls() {
+    let path =
+        env::var("PROMPTBOOT_TEST_MODEL").expect("PROMPTBOOT_TEST_MODEL; run make validate-host");
+    let file = fs::read(path).unwrap();
+    let mut model_storage = vec![0u8; file.len() + 63];
+    let model_start = (64 - (model_storage.as_ptr() as usize & 63)) & 63;
+    model_storage[model_start..model_start + file.len()].copy_from_slice(&file);
+    let model =
+        ModelView::open_authenticated(&model_storage[model_start..model_start + file.len()])
+            .unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let failure = Arc::new(AtomicU32::new(0));
+    let mut capacity_context =
+        test_dispatcher(Arc::clone(&calls), Arc::clone(&failure), 3, 0);
+    let mut tiny_kv = [0u8; 1];
+    let mut tiny_scratch = [0u8; 1];
+    let capacity = InferenceEngine::build(
+        &model,
+        &mut tiny_kv,
+        &mut tiny_scratch,
+        Some(unsafe {
+            InferenceDispatcher::new(&mut capacity_context, dispatch_scoped_workers)
+        }),
+    )
+    .err()
+    .expect("capacity preflight");
+    assert_eq!(capacity.status, InferenceStatus::CAPACITY as u32);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+
+    let mut kv = vec![0xa5u8; KV_BYTES + 64];
+    let kv_start = (64 - (kv.as_ptr() as usize & 63)) & 63;
+    let mut scratch = vec![0x5au8; SCRATCH_BYTES + 64];
+    let scratch_start = (64 - (scratch.as_ptr() as usize & 63)) & 63;
+    let mut alignment_context =
+        test_dispatcher(Arc::clone(&calls), Arc::clone(&failure), 3, 0);
+    let alignment = InferenceEngine::build(
+        &model,
+        &mut kv[kv_start + 1..kv_start + 1 + KV_BYTES],
+        &mut scratch[scratch_start..scratch_start + SCRATCH_BYTES],
+        Some(unsafe {
+            InferenceDispatcher::new(&mut alignment_context, dispatch_scoped_workers)
+        }),
+    )
+    .err()
+    .expect("alignment preflight");
+    assert_eq!(alignment.status, InferenceStatus::ALIGNMENT as u32);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+
+    let mut context = test_dispatcher(Arc::clone(&calls), Arc::clone(&failure), 3, 0);
+    let dispatcher = unsafe { InferenceDispatcher::new(&mut context, dispatch_scoped_workers) };
+    let mut engine = InferenceEngine::build(
+        &model,
+        &mut kv[kv_start..kv_start + KV_BYTES],
+        &mut scratch[scratch_start..scratch_start + SCRATCH_BYTES],
+        Some(dispatcher),
+    )
+    .unwrap();
+    let mut logits = vec![0u32; LOGIT_WORDS];
+    let mut short_logits = [0u32; 1];
+
+    assert_eq!(
+        engine.decode_selected(42, &mut logits).unwrap_err().status,
+        InferenceStatus::STATE as u32
+    );
+    assert_eq!(
+        engine.prefill(&[], 1, &mut logits).unwrap_err().status,
+        InferenceStatus::CONTEXT as u32
+    );
+    assert_eq!(
+        engine.prefill(&[42], 0, &mut logits).unwrap_err().status,
+        InferenceStatus::CONTEXT as u32
+    );
+    assert_eq!(
+        engine
+            .prefill(&[model.config().vocab_count], 1, &mut logits)
+            .unwrap_err()
+            .status,
+        InferenceStatus::TOKEN_ID as u32
+    );
+    assert_eq!(
+        engine
+            .prefill(&[42], 1, &mut short_logits)
+            .unwrap_err()
+            .status,
+        InferenceStatus::CAPACITY as u32
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+
+    engine.prefill(&[42], 1, &mut logits).unwrap();
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        engine.prefill(&[42], 1, &mut logits).unwrap_err().status,
+        InferenceStatus::STATE as u32
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(failure.load(Ordering::Acquire), 0);
+}
+
+#[test]
+#[ignore = "requires PROMPTBOOT_TEST_MODEL; run make validate-host"]
+fn inference_dispatch_cooperatively_recovers_first_middle_and_last_faults() {
+    let path =
+        env::var("PROMPTBOOT_TEST_MODEL").expect("PROMPTBOOT_TEST_MODEL; run make validate-host");
+    let file = fs::read(path).unwrap();
+    let mut model_storage = vec![0u8; file.len() + 63];
+    let model_start = (64 - (model_storage.as_ptr() as usize & 63)) & 63;
+    model_storage[model_start..model_start + file.len()].copy_from_slice(&file);
+    let model =
+        ModelView::open_authenticated(&model_storage[model_start..model_start + file.len()])
+            .unwrap();
+    let faults = [
+        (InferenceDomain::EMBEDDING, NO_LAYER),
+        (InferenceDomain::UP, 12),
+        (InferenceDomain::LOGITS, NO_LAYER),
+    ];
+
+    let mut kv = vec![0xa5u8; KV_BYTES + 63];
+    let kv_start = (64 - (kv.as_ptr() as usize & 63)) & 63;
+    let mut scratch = vec![0x5au8; SCRATCH_BYTES + 63];
+    let scratch_start = (64 - (scratch.as_ptr() as usize & 63)) & 63;
+    let mut serial_errors = Vec::new();
+    {
+        let mut serial = InferenceEngine::build(
+            &model,
+            &mut kv[kv_start..kv_start + KV_BYTES],
+            &mut scratch[scratch_start..scratch_start + SCRATCH_BYTES],
+            None,
+        )
+        .unwrap();
+        let mut logits = vec![0xfeed_face; LOGIT_WORDS];
+        for (domain, layer) in faults {
+            crate::inference::set_inference_fault_for_test(
+                domain,
+                layer,
+                0,
+                f32::NAN.to_bits(),
+            );
+            let error = serial.prefill(&[42], 1, &mut logits).unwrap_err();
+            serial_errors.push(inference_error_tuple(error));
+            assert_eq!(serial.usage().state, InferenceState::FAULTED as u32);
+            assert!(serial.scratch_is_zero_for_test());
+            assert!(logits.iter().all(|word| *word == 0));
+            assert_eq!(serial.retained_prefix_for_test(), None);
+            serial.reset().unwrap();
+            assert_eq!(serial.position(), 0);
+            assert_eq!(serial.usage().state, InferenceState::RESET as u32);
+            logits.fill(0xfeed_face);
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let failure = Arc::new(AtomicU32::new(0));
+    let mut context = test_dispatcher(Arc::clone(&calls), Arc::clone(&failure), 3, 0);
+    let dispatcher = unsafe { InferenceDispatcher::new(&mut context, dispatch_scoped_workers) };
+    let mut parallel = InferenceEngine::build(
+        &model,
+        &mut kv[kv_start..kv_start + KV_BYTES],
+        &mut scratch[scratch_start..scratch_start + SCRATCH_BYTES],
+        Some(dispatcher),
+    )
+    .unwrap();
+    let mut logits = vec![0xfeed_face; LOGIT_WORDS];
+    for ((domain, layer), expected) in faults.into_iter().zip(serial_errors) {
+        crate::inference::set_inference_fault_for_test(domain, layer, 0, f32::NAN.to_bits());
+        let error = parallel.prefill(&[42], 1, &mut logits).unwrap_err();
+        assert_eq!(inference_error_tuple(error), expected);
+        assert_eq!(parallel.usage().state, InferenceState::FAULTED as u32);
+        assert!(parallel.scratch_is_zero_for_test());
+        assert!(logits.iter().all(|word| *word == 0));
+        assert_eq!(parallel.retained_prefix_for_test(), None);
+        parallel.reset().unwrap();
+        assert_eq!(parallel.position(), 0);
+        assert_eq!(parallel.usage().state, InferenceState::RESET as u32);
+        logits.fill(0xfeed_face);
+    }
+    assert_eq!(calls.load(Ordering::Acquire), 3);
+    assert_eq!(failure.load(Ordering::Acquire), 0);
+}
+
+#[test]
+#[ignore = "requires PROMPTBOOT_TEST_MODEL; run make validate-host"]
+fn inference_multiworker_schedule_matches_serial_sessions_and_boundaries() {
+    fn assert_exact(
+        serial: &InferenceEngine<'_, '_, '_, '_>,
+        parallel: &InferenceEngine<'_, '_, '_, '_>,
+        serial_logits: &[u32],
+        parallel_logits: &[u32],
+    ) {
+        assert_eq!(serial_logits, parallel_logits);
+        assert_eq!(serial.position(), parallel.position());
+        assert_eq!(serial.usage(), parallel.usage());
+        let position = serial.position() as usize;
+        for layer in 0..crate::inference::LAYERS {
+            for kind in 0..2 {
+                for at in 0..position {
+                    for head in 0..2 {
+                        for component in 0..64 {
+                            assert_eq!(
+                                serial.logical_kv_word_for_test(
+                                    layer, kind, at, head, component,
+                                ),
+                                parallel.logical_kv_word_for_test(
+                                    layer, kind, at, head, component,
+                                ),
+                                "position={position} layer={layer} kind={kind} at={at} head={head} component={component}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let path =
+        env::var("PROMPTBOOT_TEST_MODEL").expect("PROMPTBOOT_TEST_MODEL; run make validate-host");
+    let file = fs::read(path).unwrap();
+    let mut model_storage = vec![0u8; file.len() + 63];
+    let model_start = (64 - (model_storage.as_ptr() as usize & 63)) & 63;
+    model_storage[model_start..model_start + file.len()].copy_from_slice(&file);
+    let model =
+        ModelView::open_authenticated(&model_storage[model_start..model_start + file.len()])
+            .unwrap();
+
+    let mut serial_kv = vec![0xa5u8; KV_BYTES + 63];
+    let serial_kv_start = (64 - (serial_kv.as_ptr() as usize & 63)) & 63;
+    let mut parallel_kv = vec![0x5au8; KV_BYTES + 63];
+    let parallel_kv_start = (64 - (parallel_kv.as_ptr() as usize & 63)) & 63;
+    let mut serial_scratch = vec![0xa5u8; SCRATCH_BYTES + 63];
+    let serial_scratch_start = (64 - (serial_scratch.as_ptr() as usize & 63)) & 63;
+    let mut parallel_scratch = vec![0x5au8; SCRATCH_BYTES + 63];
+    let parallel_scratch_start = (64 - (parallel_scratch.as_ptr() as usize & 63)) & 63;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let failure = Arc::new(AtomicU32::new(0));
+    let mut context = test_dispatcher(Arc::clone(&calls), Arc::clone(&failure), 4, 0);
+    let dispatcher = unsafe { InferenceDispatcher::new(&mut context, dispatch_scoped_workers) };
+    let mut serial = InferenceEngine::build(
+        &model,
+        &mut serial_kv[serial_kv_start..serial_kv_start + KV_BYTES],
+        &mut serial_scratch[serial_scratch_start..serial_scratch_start + SCRATCH_BYTES],
+        None,
+    )
+    .unwrap();
+    let mut parallel = InferenceEngine::build(
+        &model,
+        &mut parallel_kv[parallel_kv_start..parallel_kv_start + KV_BYTES],
+        &mut parallel_scratch[parallel_scratch_start..parallel_scratch_start + SCRATCH_BYTES],
+        Some(dispatcher),
+    )
+    .unwrap();
+    serial.force_backend_for_test(crate::fp32_sse2::InferenceBackend::Sse2);
+    let mut serial_logits = vec![0u32; LOGIT_WORDS];
+    let mut parallel_logits = vec![0u32; LOGIT_WORDS];
+
+    assert_eq!(
+        serial.prefill(&[198], 1024, &mut serial_logits).unwrap(),
+        parallel
+            .prefill(&[198], 1024, &mut parallel_logits)
+            .unwrap()
+    );
+    assert_exact(&serial, &parallel, &serial_logits, &parallel_logits);
+    for target in [3u32, 4, 5, 255, 256, 511, 512] {
+        while serial.position() < target {
+            assert_eq!(
+                serial
+                    .decode_selected(198, &mut serial_logits)
+                    .unwrap(),
+                parallel
+                    .decode_selected(198, &mut parallel_logits)
+                    .unwrap()
+            );
+        }
+        assert_exact(&serial, &parallel, &serial_logits, &parallel_logits);
+    }
+
+    serial.reset().unwrap();
+    parallel.reset().unwrap();
+    assert_exact(&serial, &parallel, &serial_logits, &parallel_logits);
+    assert_eq!(
+        serial
+            .prefill_with_prefix(&[42, 43], 1, 32, &mut serial_logits)
+            .unwrap(),
+        parallel
+            .prefill_with_prefix(&[42, 43], 1, 32, &mut parallel_logits)
+            .unwrap()
+    );
+    assert_exact(&serial, &parallel, &serial_logits, &parallel_logits);
+    assert_eq!(serial.reset_to_prefix().unwrap(), 1);
+    assert_eq!(parallel.reset_to_prefix().unwrap(), 1);
+    assert_eq!(
+        serial
+            .prefill_with_prefix(&[42, 44], 1, 32, &mut serial_logits)
+            .unwrap(),
+        parallel
+            .prefill_with_prefix(&[42, 44], 1, 32, &mut parallel_logits)
+            .unwrap()
+    );
+    assert_exact(&serial, &parallel, &serial_logits, &parallel_logits);
+    assert_eq!(
+        serial
+            .append_prefill(&[45, 46], 32, &mut serial_logits)
+            .unwrap(),
+        parallel
+            .append_prefill(&[45, 46], 32, &mut parallel_logits)
+            .unwrap()
+    );
+    assert_exact(&serial, &parallel, &serial_logits, &parallel_logits);
+
+    serial.reset().unwrap();
+    parallel.reset().unwrap();
+    assert_eq!(
+        serial.prefill(&[99, 100], 32, &mut serial_logits).unwrap(),
+        parallel
+            .prefill(&[99, 100], 32, &mut parallel_logits)
+            .unwrap()
+    );
+    assert_exact(&serial, &parallel, &serial_logits, &parallel_logits);
+    assert_eq!(failure.load(Ordering::Acquire), 0);
+    assert_eq!(calls.load(Ordering::Acquire), 519);
+
+    drop(serial);
+    drop(parallel);
+    assert!(serial_kv[..serial_kv_start].iter().all(|byte| *byte == 0xa5));
+    assert!(serial_kv[serial_kv_start + KV_BYTES..]
+        .iter()
+        .all(|byte| *byte == 0xa5));
+    assert!(parallel_kv[..parallel_kv_start]
+        .iter()
+        .all(|byte| *byte == 0x5a));
+    assert!(parallel_kv[parallel_kv_start + KV_BYTES..]
+        .iter()
+        .all(|byte| *byte == 0x5a));
+}
+
+#[test]
+#[ignore = "requires PROMPTBOOT_TEST_MODEL; run make validate-host"]
+fn real_model_attention_backends_match_all_boundary_state() {
+    let path =
+        env::var("PROMPTBOOT_TEST_MODEL").expect("PROMPTBOOT_TEST_MODEL; run make validate-host");
+    let file = fs::read(path).unwrap();
+    let mut model_storage = vec![0u8; file.len() + 63];
+    let model_start = (64 - (model_storage.as_ptr() as usize & 63)) & 63;
+    model_storage[model_start..model_start + file.len()].copy_from_slice(&file);
+    let model =
+        ModelView::open_authenticated(&model_storage[model_start..model_start + file.len()])
+            .unwrap();
+    assert!(inference_avx2_available());
+
+    let mut sse2_kv = vec![0xa5u8; KV_BYTES + 63];
+    let sse2_kv_start = (64 - (sse2_kv.as_ptr() as usize & 63)) & 63;
+    let mut avx2_kv = vec![0x5au8; KV_BYTES + 63];
+    let avx2_kv_start = (64 - (avx2_kv.as_ptr() as usize & 63)) & 63;
+    let mut sse2_scratch = vec![0u8; SCRATCH_BYTES + 63];
+    let sse2_scratch_start = (64 - (sse2_scratch.as_ptr() as usize & 63)) & 63;
+    let mut avx2_scratch = vec![0u8; SCRATCH_BYTES + 63];
+    let avx2_scratch_start = (64 - (avx2_scratch.as_ptr() as usize & 63)) & 63;
+    let mut sse2 = InferenceEngine::build(
+        &model,
+        &mut sse2_kv[sse2_kv_start..sse2_kv_start + KV_BYTES],
+        &mut sse2_scratch[sse2_scratch_start..sse2_scratch_start + SCRATCH_BYTES],
+        None,
+    )
+    .unwrap();
+    let mut avx2 = InferenceEngine::build(
+        &model,
+        &mut avx2_kv[avx2_kv_start..avx2_kv_start + KV_BYTES],
+        &mut avx2_scratch[avx2_scratch_start..avx2_scratch_start + SCRATCH_BYTES],
+        None,
+    )
+    .unwrap();
+    sse2.force_backend_for_test(crate::fp32_sse2::InferenceBackend::Sse2);
+    avx2.force_backend_for_test(crate::fp32_sse2::InferenceBackend::Avx2);
+    let mut sse2_logits = vec![0u32; LOGIT_WORDS];
+    let mut avx2_logits = vec![0u32; LOGIT_WORDS];
+    sse2.prefill(&[198], 512, &mut sse2_logits).unwrap();
+    avx2.prefill(&[198], 512, &mut avx2_logits).unwrap();
+
+    for target in [1usize, 3, 4, 5, 255, 256, 511, 512] {
+        while sse2.position() < target as u32 {
+            sse2.decode_selected(198, &mut sse2_logits).unwrap();
+            avx2.decode_selected(198, &mut avx2_logits).unwrap();
+        }
+        assert_eq!(sse2.position(), target as u32);
+        assert_eq!(avx2.position(), target as u32);
+        assert_eq!(sse2_logits, avx2_logits, "N={target} logits");
+        for layer in 0..crate::inference::LAYERS {
+            for kind in 0..2 {
+                for position in 0..target {
+                    for head in 0..2 {
+                        for component in 0..64 {
+                            assert_eq!(
+                                sse2.logical_kv_word_for_test(
+                                    layer, kind, position, head, component,
+                                ),
+                                avx2.logical_kv_word_for_test(
+                                    layer, kind, position, head, component,
+                                ),
+                                "N={target} layer={layer} kind={kind} position={position} head={head} component={component}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires PROMPTBOOT_TEST_MODEL; run make validate-host"]
+fn real_model_near_limit_reset_reuses_exact_prefix_and_faults_closed() {
+    let path =
+        env::var("PROMPTBOOT_TEST_MODEL").expect("PROMPTBOOT_TEST_MODEL; run make validate-host");
+    let file = fs::read(path).unwrap();
+    let mut model_storage = vec![0u8; file.len() + 63];
+    let model_start = (64 - (model_storage.as_ptr() as usize & 63)) & 63;
+    model_storage[model_start..model_start + file.len()].copy_from_slice(&file);
+    let model =
+        ModelView::open_authenticated(&model_storage[model_start..model_start + file.len()])
+            .unwrap();
+    let config = model.config();
+
+    let mut index_storage = vec![0u8; INDEX_BYTES + 63];
+    let index_start = (64 - (index_storage.as_ptr() as usize & 63)) & 63;
+    let tokenizer = FrozenTokenizer::build(
+        &model,
+        &mut index_storage[index_start..index_start + INDEX_BYTES],
+    )
+    .unwrap();
+    let mut rendered = vec![0u8; 660];
+    let mut staging = vec![0u32; 599];
+    let mut working = vec![0u32; CONTEXT_LIMIT as usize];
+    let mut tokenizer_scratch = vec![0u8; 5_120 + 63];
+    let tokenizer_scratch_start = (64 - (tokenizer_scratch.as_ptr() as usize & 63)) & 63;
+    let tokenizer_scratch =
+        &mut tokenizer_scratch[tokenizer_scratch_start..tokenizer_scratch_start + 5_120];
+
+    let hello = tokenizer
+        .render_and_tokenize(b"Hello", &mut rendered, &mut staging, tokenizer_scratch)
+        .unwrap();
+    let hello_tokens = staging[..hello.token_count as usize].to_vec();
+
+    let mut near_history = vec![198u32; PROMPT_LIMIT];
+    *near_history.last_mut().unwrap() = crate::tokenizer::IM_END;
+    tokenizer
+        .validate_conversation_history(&near_history)
+        .unwrap();
+    working.fill(0xfeed_face);
+    let mut overflow_outcome = ConversationUsage::ZERO;
+    let overflow = tokenizer
+        .render_conversation_and_tokenize(
+            &near_history,
+            b"Name one color.",
+            &mut rendered,
+            &mut staging,
+            &mut working,
+            tokenizer_scratch,
+            &mut overflow_outcome,
+        )
+        .unwrap_err();
+    assert_eq!(overflow.status, ModelStatus::OUTPUT_CAPACITY as u32);
+    assert_eq!(
+        decide_history(true, overflow_outcome.prompt_tokens as usize, None),
+        HistoryDecision::RetryFresh
+    );
+    assert!(working.iter().all(|token| *token == 0xfeed_face));
+
+    let mut fresh_outcome = ConversationUsage::ZERO;
+    let fresh = tokenizer
+        .render_conversation_and_tokenize(
+            &[],
+            b"Name one color.",
+            &mut rendered,
+            &mut staging,
+            &mut working,
+            tokenizer_scratch,
+            &mut fresh_outcome,
+        )
+        .unwrap();
+    assert_eq!(
+        decide_history(
+            true,
+            overflow_outcome.prompt_tokens as usize,
+            Some(fresh.prompt_tokens as usize),
+        ),
+        HistoryDecision::Reset {
+            prompt_tokens: fresh.prompt_tokens as usize,
+        }
+    );
+    assert_eq!(fresh.prefix_tokens, hello.prefix_tokens);
+    let fresh_tokens = working[..fresh.prompt_tokens as usize].to_vec();
+
+    let mut retained_kv = vec![0xa5u8; KV_BYTES + 63];
+    let retained_kv_start = (64 - (retained_kv.as_ptr() as usize & 63)) & 63;
+    let mut retained_scratch = vec![0u8; SCRATCH_BYTES + 63];
+    let retained_scratch_start = (64 - (retained_scratch.as_ptr() as usize & 63)) & 63;
+    let mut retained = InferenceEngine::build(
+        &model,
+        &mut retained_kv[retained_kv_start..retained_kv_start + KV_BYTES],
+        &mut retained_scratch[retained_scratch_start..retained_scratch_start + SCRATCH_BYTES],
+        None,
+    )
+    .unwrap();
+    let mut retained_logits = vec![0u32; LOGIT_WORDS];
+    retained
+        .prefill_with_prefix(&hello_tokens, hello.prefix_tokens, 1, &mut retained_logits)
+        .unwrap();
+
+    let mut committed = near_history;
+    let mut cached_len = PROMPT_LIMIT - 1;
+    let mut committed_len = PROMPT_LIMIT;
+    let mut history_turns = 7;
+    let retained_position = reset_conversation_for_fresh_prompt(
+        &mut retained,
+        &mut committed,
+        &mut working,
+        fresh.prompt_tokens as usize,
+        &mut cached_len,
+        &mut committed_len,
+        &mut history_turns,
+    )
+    .unwrap();
+    assert_eq!(retained_position, fresh.prefix_tokens);
+    assert_eq!(retained.position(), fresh.prefix_tokens);
+    assert_eq!((cached_len, committed_len, history_turns), (0, 0, 0));
+    assert!(committed.iter().all(|token| *token == 0));
+    assert_eq!(&working[..fresh_tokens.len()], fresh_tokens);
+    assert!(working[fresh_tokens.len()..]
+        .iter()
+        .all(|token| *token == 0));
+    retained
+        .prefill_with_prefix(&fresh_tokens, fresh.prefix_tokens, 1, &mut retained_logits)
+        .unwrap();
+    let retained_position = retained.position() as usize;
+    drop(retained);
+    let retained_kv_words = used_kv_words(
+        &retained_kv[retained_kv_start..retained_kv_start + KV_BYTES],
+        retained_position,
+        config,
+    );
+    drop(retained_kv);
+    drop(retained_scratch);
+
+    let mut fresh_kv = vec![0u8; KV_BYTES + 63];
+    let fresh_kv_start = (64 - (fresh_kv.as_ptr() as usize & 63)) & 63;
+    let mut fresh_scratch = vec![0u8; SCRATCH_BYTES + 63];
+    let fresh_scratch_start = (64 - (fresh_scratch.as_ptr() as usize & 63)) & 63;
+    let mut fresh_engine = InferenceEngine::build(
+        &model,
+        &mut fresh_kv[fresh_kv_start..fresh_kv_start + KV_BYTES],
+        &mut fresh_scratch[fresh_scratch_start..fresh_scratch_start + SCRATCH_BYTES],
+        None,
+    )
+    .unwrap();
+    let mut fresh_logits = vec![0u32; LOGIT_WORDS];
+    fresh_engine
+        .prefill(&fresh_tokens, 1, &mut fresh_logits)
+        .unwrap();
+    let fresh_position = fresh_engine.position() as usize;
+    drop(fresh_engine);
+    let fresh_kv_words = used_kv_words(
+        &fresh_kv[fresh_kv_start..fresh_kv_start + KV_BYTES],
+        fresh_position,
+        config,
+    );
+    assert_eq!(retained_position, fresh_position);
+    assert_eq!(retained_logits, fresh_logits);
+    assert_eq!(retained_kv_words, fresh_kv_words);
+    drop(fresh_kv);
+    drop(fresh_scratch);
+
+    working[..fresh_tokens.len()].copy_from_slice(&fresh_tokens);
+    working[fresh_tokens.len()..].fill(0xfeed_face);
+    committed.fill(0xfeed_face);
+    *committed.last_mut().unwrap() = crate::tokenizer::IM_END;
+    cached_len = PROMPT_LIMIT - 1;
+    committed_len = PROMPT_LIMIT;
+    history_turns = 9;
+    let mut fault_kv = vec![0xa5u8; KV_BYTES + 63];
+    let fault_kv_start = (64 - (fault_kv.as_ptr() as usize & 63)) & 63;
+    let mut fault_scratch = vec![0u8; SCRATCH_BYTES + 63];
+    let fault_scratch_start = (64 - (fault_scratch.as_ptr() as usize & 63)) & 63;
+    let mut fault_engine = InferenceEngine::build(
+        &model,
+        &mut fault_kv[fault_kv_start..fault_kv_start + KV_BYTES],
+        &mut fault_scratch[fault_scratch_start..fault_scratch_start + SCRATCH_BYTES],
+        None,
+    )
+    .unwrap();
+    fault_engine
+        .prefill_with_prefix(&hello_tokens, hello.prefix_tokens, 1, &mut retained_logits)
+        .unwrap();
+    assert_eq!(
+        reset_conversation_for_fresh_prompt(
+            &mut fault_engine,
+            &mut committed,
+            &mut working,
+            fresh_tokens.len(),
+            &mut cached_len,
+            &mut committed_len,
+            &mut history_turns,
+        )
+        .unwrap(),
+        fresh.prefix_tokens
+    );
+    crate::inference::set_inference_fault_for_test(
+        InferenceDomain::EMBEDDING,
+        NO_LAYER,
+        0,
+        f32::NAN.to_bits(),
+    );
+    assert!(fault_engine
+        .prefill_with_prefix(&fresh_tokens, fresh.prefix_tokens, 1, &mut retained_logits,)
+        .is_err());
+    assert_eq!(fault_engine.usage().state, InferenceState::FAULTED as u32);
+    committed.fill(0xfeed_face);
+    working[fresh_tokens.len()..].fill(0xfeed_face);
+    cached_len = fresh_tokens.len() - 1;
+    committed_len = fresh_tokens.len();
+    history_turns = 1;
+    assert_eq!(
+        reset_conversation_for_fresh_prompt(
+            &mut fault_engine,
+            &mut committed,
+            &mut working,
+            fresh_tokens.len(),
+            &mut cached_len,
+            &mut committed_len,
+            &mut history_turns,
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(fault_engine.position(), 0);
+    assert_eq!(fault_engine.usage().state, InferenceState::RESET as u32);
+    assert_eq!((cached_len, committed_len, history_turns), (0, 0, 0));
+    assert!(committed.iter().all(|token| *token == 0));
+    assert!(working[fresh_tokens.len()..]
+        .iter()
+        .all(|token| *token == 0));
+    fault_engine
+        .prefill_with_prefix(&fresh_tokens, fresh.prefix_tokens, 1, &mut retained_logits)
+        .unwrap();
+    let recovered_position = fault_engine.position() as usize;
+    drop(fault_engine);
+    let recovered_kv_words = used_kv_words(
+        &fault_kv[fault_kv_start..fault_kv_start + KV_BYTES],
+        recovered_position,
+        config,
+    );
+    assert_eq!(recovered_position, fresh_position);
+    assert_eq!(retained_logits, fresh_logits);
+    assert_eq!(recovered_kv_words, fresh_kv_words);
 }
 
 #[test]
@@ -1288,7 +2546,8 @@ fn model_runtime_abi_and_sha256_vectors_are_exact() {
     assert_eq!(offset_of!(TensorMeta, data_offset), 32);
     assert_eq!(offset_of!(TensorMeta, reserved), 56);
     assert_eq!(size_of::<TokenizerUsage>(), 40);
-    assert_eq!(size_of::<PromptUsage>(), 16);
+    assert_eq!(size_of::<PromptUsage>(), 20);
+    assert_eq!(size_of::<ConversationUsage>(), 24);
     assert_eq!(size_of::<PieceUsage>(), 8);
 
     let vector = |input: &[u8], expected: &str| {
@@ -1321,6 +2580,109 @@ fn model_runtime_abi_and_sha256_vectors_are_exact() {
         &million_a,
         "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
     );
+}
+
+#[test]
+fn sha256_boundaries_partitions_and_backends_are_exact() {
+    const CASES: &[(usize, &str)] = &[
+        (
+            55,
+            "2900465fcb533e05a158fd2b3be0e5e3b03740d83060aa3580e0d98a96bf2384",
+        ),
+        (
+            56,
+            "31454ff48ef36af2f08fd511bdc37d9d5855ac23e992e5ff5445cb6b7674a674",
+        ),
+        (
+            63,
+            "5f6401b96532c36de4e65beec0409b69b1d181864c8009b7a04f43e5d56350d1",
+        ),
+        (
+            64,
+            "94eb5de4943613fd048dc93393ab06877405faa39c11f53e9386083339833e7e",
+        ),
+        (
+            65,
+            "fc518669b6eb4b4dd91827ecacef86689c725bd5bab888fd3b26dbb196eec954",
+        ),
+        (
+            119,
+            "b0dc41b1a384e2f1203f0351b38fbeaafceef577ce1191d5bfc25da39f721eae",
+        ),
+        (
+            120,
+            "5df24dd802ac26132ce608dcb5f09841eef039ee0f152acf98d26d17fe4e88e6",
+        ),
+        (
+            127,
+            "0fe729ff19257bd6fec853acc2ea355f6b34b58e6c0f684c3e188fcdfcd9baae",
+        ),
+        (
+            128,
+            "0aedd4856f8eba0963627336ad5144a9a7dbe12498e6066f0165fc97d8ddee4c",
+        ),
+    ];
+
+    let partitioned = |state: &mut crate::sha256::Sha256, input: &[u8]| {
+        const WIDTHS: [usize; 8] = [0, 1, 7, 3, 16, 5, 31, 2];
+        state.update(&[]);
+        let mut offset = 0;
+        let mut partition = 0;
+        while offset < input.len() {
+            let width = WIDTHS[partition % WIDTHS.len()];
+            partition += 1;
+            if width == 0 {
+                state.update(&[]);
+                continue;
+            }
+            let end = core::cmp::min(offset + width, input.len());
+            state.update(&input[offset..end]);
+            offset = end;
+        }
+        state.update(&[]);
+    };
+
+    for &(length, expected_hex) in CASES {
+        let input: Vec<u8> = (0..length)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let expected: [u8; 32] = hex(expected_hex).try_into().unwrap();
+        assert_eq!(crate::sha256::digest(&input), expected, "length {length}");
+
+        let mut scalar = crate::sha256::Sha256::new();
+        scalar.force_scalar_for_test();
+        partitioned(&mut scalar, &input);
+        assert_eq!(scalar.finish(), expected, "scalar length {length}");
+
+        let mut sha_ni = crate::sha256::Sha256::new();
+        if sha_ni.force_sha_ni_for_test() {
+            partitioned(&mut sha_ni, &input);
+            assert_eq!(sha_ni.finish(), expected, "SHA-NI length {length}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires PROMPTBOOT_TEST_MODEL; run make validate-host"]
+fn sha256_packed_model_backends_are_exact() {
+    let path =
+        env::var("PROMPTBOOT_TEST_MODEL").expect("PROMPTBOOT_TEST_MODEL; run make validate-host");
+    let model = fs::read(path).expect("read packed model");
+    let expected: [u8; 32] =
+        hex("b0f98ed6e0557ca35e1bced1000c950b3c84414251df65290315a7969981d42d")
+            .try_into()
+            .unwrap();
+
+    let mut scalar = crate::sha256::Sha256::new();
+    scalar.force_scalar_for_test();
+    scalar.update(&model);
+    assert_eq!(scalar.finish(), expected, "packed model scalar");
+
+    let mut sha_ni = crate::sha256::Sha256::new();
+    if sha_ni.force_sha_ni_for_test() {
+        sha_ni.update(&model);
+        assert_eq!(sha_ni.finish(), expected, "packed model SHA-NI");
+    }
 }
 
 #[test]
@@ -1495,6 +2857,7 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
     rendered.fill(0);
     tokens.fill(0);
     let mut conversation = vec![0xfeed_faceu32; CONTEXT_LIMIT as usize];
+    let mut conversation_outcome = ConversationUsage::ZERO;
     let fresh = tokenizer
         .render_conversation_and_tokenize(
             &[],
@@ -1503,11 +2866,13 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
             &mut tokens,
             &mut conversation,
             &mut scratch.0,
+            &mut conversation_outcome,
         )
         .unwrap();
     assert_eq!(fresh.prompt_tokens, 30);
     assert_eq!(fresh.fresh_prompt_tokens, 30);
     assert_eq!(fresh.user_tokens, 1);
+    assert_eq!(fresh.prefix_tokens, 24);
     let mut history = [0u32; 32];
     history[..30].copy_from_slice(&conversation[..30]);
     history[30] = 9707;
@@ -1521,6 +2886,7 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
             &mut tokens,
             &mut conversation,
             &mut scratch.0,
+            &mut conversation_outcome,
         )
         .unwrap();
     assert_eq!(second.history_tokens, 32);
@@ -1539,6 +2905,7 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
             &mut tokens,
             &mut conversation,
             &mut scratch.0,
+            &mut conversation_outcome,
         )
         .unwrap_err();
     assert_eq!(
@@ -1574,6 +2941,7 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
             &mut tokens,
             &mut conversation,
             &mut scratch.0,
+            &mut conversation_outcome,
         )
         .unwrap_err();
     assert_eq!(
@@ -1602,6 +2970,7 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
             &mut tokens,
             &mut conversation,
             &mut scratch.0,
+            &mut conversation_outcome,
         )
         .unwrap_err();
     assert_eq!(
@@ -1622,6 +2991,7 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
             &mut short_staging,
             &mut conversation,
             &mut scratch.0,
+            &mut conversation_outcome,
         )
         .unwrap_err();
     assert_eq!(
@@ -1642,6 +3012,7 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
             &mut tokens,
             &mut short_output,
             &mut scratch.0,
+            &mut conversation_outcome,
         )
         .unwrap_err();
     assert_eq!(
@@ -1671,6 +3042,7 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
             &mut tokens,
             &mut conversation,
             &mut scratch.0,
+            &mut conversation_outcome,
         )
         .unwrap_err();
     assert_eq!(
@@ -1689,6 +3061,14 @@ fn real_model_index_identity_failures_roll_back_zero_prefix() {
     assert!(tokens.iter().all(|word| *word == 0xfeed_face));
     assert!(conversation.iter().all(|word| *word == 0xfeed_face));
     assert!(scratch.0.iter().all(|byte| *byte == 0));
+    assert_eq!(conversation_outcome.user_tokens, 1);
+    assert_eq!(conversation_outcome.fresh_prompt_tokens, 30);
+    assert_eq!(conversation_outcome.history_tokens, CONTEXT_LIMIT);
+    assert_eq!(
+        conversation_outcome.prompt_tokens,
+        CONTEXT_LIMIT.saturating_add(10)
+    );
+    assert_eq!(conversation_outcome.prefix_tokens, 24);
 
     drop(tokenizer);
     drop(model);
@@ -2605,10 +3985,19 @@ fn inference_q4_block_dot_matches_scalar_nibble_order_and_extrema() {
             + (i32::from(packed & 0x0f) - 8) * i32::from(ordered_activation[16 + index])
     });
     assert_ne!(ordered_expected, swapped_expected, "ordering fixture");
-    assert_eq!(
-        crate::fp32_sse2::inference_q4_block_dot_for_test(&ordered_weights, &ordered_activation),
-        ordered_expected
-    );
+    for backend in [
+        crate::fp32_sse2::InferenceBackend::Sse2,
+        crate::fp32_sse2::InferenceBackend::detect(),
+    ] {
+        assert_eq!(
+            crate::fp32_sse2::inference_q4_block_dot_for_test(
+                backend,
+                &ordered_weights,
+                &ordered_activation
+            ),
+            ordered_expected
+        );
+    }
 
     let extrema_weights = core::array::from_fn(|index| if index & 1 == 0 { 0x0f } else { 0xf0 });
     let extrema_activation = core::array::from_fn(|index| {
@@ -2618,10 +4007,19 @@ fn inference_q4_block_dot_matches_scalar_nibble_order_and_extrema() {
             i8::MAX
         }
     });
-    assert_eq!(
-        crate::fp32_sse2::inference_q4_block_dot_for_test(&extrema_weights, &extrema_activation),
-        scalar_dot(&extrema_weights, &extrema_activation)
-    );
+    for backend in [
+        crate::fp32_sse2::InferenceBackend::Sse2,
+        crate::fp32_sse2::InferenceBackend::detect(),
+    ] {
+        assert_eq!(
+            crate::fp32_sse2::inference_q4_block_dot_for_test(
+                backend,
+                &extrema_weights,
+                &extrema_activation
+            ),
+            scalar_dot(&extrema_weights, &extrema_activation)
+        );
+    }
 }
 
 #[test]
@@ -2641,10 +4039,70 @@ fn inference_q8_block_dot_matches_scalar_signed_extrema() {
             total + i32::from(weight) * i32::from(activation)
         });
     assert_eq!(expected, 8, "signed-extrema fixture");
-    assert_eq!(
-        crate::fp32_sse2::inference_q8_block_dot_for_test(&weights, &activation),
-        expected
-    );
+    for backend in [
+        crate::fp32_sse2::InferenceBackend::Sse2,
+        crate::fp32_sse2::InferenceBackend::detect(),
+    ] {
+        assert_eq!(
+            crate::fp32_sse2::inference_q8_block_dot_for_test(backend, &weights, &activation),
+            expected
+        );
+    }
+}
+
+#[test]
+fn inference_block_dots_match_scalar_oracles_across_deterministic_inputs() {
+    let q4_scalar = |weights: &[u8; 16], activation: &[i8; 32]| {
+        (0..16).fold(0i32, |total, index| {
+            let packed = weights[index];
+            total
+                + (i32::from(packed & 0x0f) - 8) * i32::from(activation[index])
+                + (i32::from(packed >> 4) - 8) * i32::from(activation[16 + index])
+        })
+    };
+    let q8_scalar = |weights: &[i8; 32], activation: &[i8; 32]| {
+        weights
+            .iter()
+            .zip(activation)
+            .fold(0i32, |total, (&weight, &value)| {
+                total + i32::from(weight) * i32::from(value)
+            })
+    };
+    let mut state = 0x243f_6a88u32;
+    for case in 0..256 {
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let q4_weights = core::array::from_fn(|_| next());
+        let q8_weights = core::array::from_fn(|_| next() as i8);
+        let activation = core::array::from_fn(|_| next() as i8);
+        for backend in [
+            crate::fp32_sse2::InferenceBackend::Sse2,
+            crate::fp32_sse2::InferenceBackend::detect(),
+        ] {
+            assert_eq!(
+                crate::fp32_sse2::inference_q4_block_dot_for_test(
+                    backend,
+                    &q4_weights,
+                    &activation
+                ),
+                q4_scalar(&q4_weights, &activation),
+                "Q4 case {case} backend {}",
+                backend.name()
+            );
+            assert_eq!(
+                crate::fp32_sse2::inference_q8_block_dot_for_test(
+                    backend,
+                    &q8_weights,
+                    &activation
+                ),
+                q8_scalar(&q8_weights, &activation),
+                "Q8 case {case} backend {}",
+                backend.name()
+            );
+        }
+    }
 }
 
 #[test]
@@ -2702,21 +4160,34 @@ fn inference_kernel_bit_fixtures_match_pinned_llama_sse2() {
     let mut q4_output = [0u32; 1];
     let mut q8_output = [0u32; 1];
     unsafe {
-        crate::fp32_sse2::inference_q4_matvec(
+        crate::fp32_sse2::inference_prepare_q8(mat_input.as_ptr().cast(), stage.as_mut_ptr(), 64);
+    }
+    let prepared = stage[..5_184].to_vec();
+    assert!(prepared[68..].iter().all(|byte| *byte == 0));
+    unsafe {
+        crate::fp32_sse2::inference_q4_matvec_rows_prepared(
+            crate::fp32_sse2::InferenceBackend::Sse2,
             q4.as_ptr(),
-            mat_input.as_ptr().cast(),
             q4_output.as_mut_ptr().cast(),
             stage.as_mut_ptr(),
             1,
             64,
+            0,
+            1,
         );
-        crate::fp32_sse2::inference_q8_matvec(
+    }
+    assert_eq!(&stage[..5_184], prepared);
+    unsafe {
+        crate::fp32_sse2::inference_prepare_q8(mat_input.as_ptr().cast(), stage.as_mut_ptr(), 64);
+        crate::fp32_sse2::inference_q8_matvec_rows_prepared(
+            crate::fp32_sse2::InferenceBackend::Sse2,
             q8.as_ptr(),
-            mat_input.as_ptr().cast(),
             q8_output.as_mut_ptr(),
             stage.as_mut_ptr(),
             1,
             64,
+            0,
+            1,
         );
     }
     assert_eq!(q4_output, [0x43e0_8000]);
@@ -2725,7 +4196,40 @@ fn inference_kernel_bit_fixtures_match_pinned_llama_sse2() {
         [word_bytes(&q4_output), word_bytes(&q8_output)].concat(),
         include_bytes!("../../../fixtures/inference/kernels/dots.bin")
     );
-    assert!(stage[..5_184].iter().all(|byte| *byte == 0));
+    if crate::fp32_sse2::InferenceBackend::detect() == crate::fp32_sse2::InferenceBackend::Avx2 {
+        let mut avx_q4 = [0u32; 1];
+        let mut avx_q8 = [0u32; 1];
+        unsafe {
+            crate::fp32_sse2::inference_prepare_q8(
+                mat_input.as_ptr().cast(),
+                stage.as_mut_ptr(),
+                64,
+            );
+            crate::fp32_sse2::inference_q4_matvec_rows_prepared(
+                crate::fp32_sse2::InferenceBackend::Avx2,
+                q4.as_ptr(),
+                avx_q4.as_mut_ptr().cast(),
+                stage.as_mut_ptr(),
+                1,
+                64,
+                0,
+                1,
+            );
+            crate::fp32_sse2::inference_q8_matvec_rows_prepared(
+                crate::fp32_sse2::InferenceBackend::Avx2,
+                q8.as_ptr(),
+                avx_q8.as_mut_ptr(),
+                stage.as_mut_ptr(),
+                1,
+                64,
+                0,
+                1,
+            );
+        }
+        assert_eq!(avx_q4, q4_output);
+        assert_eq!(avx_q8, q8_output);
+    }
+    assert_eq!(&stage[..5_184], prepared);
     assert!(stage[5_184..].iter().all(|byte| *byte == 0xa5));
 
     let rms_input: Vec<u32> = (0..896)
@@ -2847,9 +4351,9 @@ fn inference_kernel_bit_fixtures_match_pinned_llama_sse2() {
     let mut query: Vec<u32> = (0..896)
         .map(|index| (((index % 23) as i32 - 11) as f32 / 16.0).to_bits())
         .collect();
-    let mut kv = vec![0u32; KV_BYTES / 4];
+    let mut kv = vec![0u32; crate::inference::KV_LAYER_WORDS];
     let kv_index = |kind: usize, position: usize, head: usize, component: usize| {
-        ((((kind * CONTEXT_LIMIT as usize + position) * 2 + head) * 64) + component) as usize
+        crate::inference::kv_word(0, kind, position, head, component)
     };
     for position in 0..=256 {
         for head in 0..2 {
@@ -2866,6 +4370,7 @@ fn inference_kernel_bit_fixtures_match_pinned_llama_sse2() {
     let mut scores = vec![0u32; 512];
     unsafe {
         crate::fp32_sse2::inference_attention(
+            crate::fp32_sse2::InferenceBackend::Sse2,
             query.as_ptr().cast(),
             kv.as_ptr().cast(),
             attention.as_mut_ptr().cast(),
@@ -2898,6 +4403,7 @@ fn inference_kernel_bit_fixtures_match_pinned_llama_sse2() {
     query.rotate_left(7);
     unsafe {
         crate::fp32_sse2::inference_attention(
+            crate::fp32_sse2::InferenceBackend::Sse2,
             query.as_ptr().cast(),
             kv.as_ptr().cast(),
             attention.as_mut_ptr().cast(),
